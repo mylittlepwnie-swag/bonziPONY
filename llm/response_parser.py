@@ -1,6 +1,7 @@
 """
 Parses LLM responses to extract [ACTION:XYZ], [DESKTOP:cmd:args],
-[DIRECTIVE:goal:urgency], [TIMER:...], and [ROUTINE:...] tags and clean spoken text.
+[DIRECTIVE:goal:urgency], [TIMER:...], [ROUTINE:...], and [QUERY:...] tags
+and clean spoken text.
 """
 
 from __future__ import annotations
@@ -50,8 +51,11 @@ _MOVETO_PATTERN = re.compile(r"\[MOVETO:\s*([^\]]+?)\s*\]", re.IGNORECASE)
 # Matches [RULE:quit porn] or [RULE:stop buying CS2 items] — create a standing rule
 _RULE_PATTERN = re.compile(r"\[RULE:([^\]]+)\]", re.IGNORECASE)
 
+# Matches [QUERY:FILE_TREE:C:/Users], [QUERY:CLIPBOARD_HISTORY], [QUERY:READ_NOTEPAD]
+_QUERY_PATTERN = re.compile(r"\[QUERY:([^\]]+)\]", re.IGNORECASE)
+
 # Catch-all: strip any remaining [TAG:...] bracket expressions the LLM may produce
-_LEFTOVER_TAG_PATTERN = re.compile(r"\[(?:MOVETO|PERSIST|ANIM|ACTION|CONVO|DESKTOP|DIRECTIVE|TIMER|ROUTINE|ENFORCE|DONE|DELAY|RULE)\s*:[^\]]*\]", re.IGNORECASE)
+_LEFTOVER_TAG_PATTERN = re.compile(r"\[(?:MOVETO|PERSIST|ANIM|ACTION|CONVO|DESKTOP|DIRECTIVE|TIMER|ROUTINE|ENFORCE|DONE|DELAY|RULE|QUERY)\s*:[^\]]*\]", re.IGNORECASE)
 
 # Strip <think>...</think> blocks from reasoning models (DeepSeek, QwQ, etc.)
 _THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -130,6 +134,7 @@ class ParsedResponse:
     persist_seconds: Optional[int] = None  # keep action animation for N seconds
     moveto_region: Optional[str] = None    # move pony to screen region
     standing_rule: Optional[str] = None    # create a permanent standing rule
+    query_requests: List[str] = field(default_factory=list)  # [QUERY:...] tags to execute
 
 
 def parse_response(raw: str) -> ParsedResponse:
@@ -357,6 +362,9 @@ def parse_response(raw: str) -> ParsedResponse:
     if rule_match:
         standing_rule = rule_match.group(1).strip()
 
+    # Parse [QUERY:...] tags — collected as raw tag strings for pipeline execution
+    query_requests = [m.group(0) for m in _QUERY_PATTERN.finditer(raw)]
+
     clean_text = _ACTION_PATTERN.sub("", raw)
     clean_text = _DESKTOP_PATTERN.sub("", clean_text)
     clean_text = _DESKTOP_TRUNCATED.sub("", clean_text)
@@ -370,6 +378,7 @@ def parse_response(raw: str) -> ParsedResponse:
     clean_text = _PERSIST_PATTERN.sub("", clean_text)
     clean_text = _MOVETO_PATTERN.sub("", clean_text)
     clean_text = _RULE_PATTERN.sub("", clean_text)
+    clean_text = _QUERY_PATTERN.sub("", clean_text)
     clean_text = _LEFTOVER_TAG_PATTERN.sub("", clean_text).strip()
     # Sanitize for TTS — strip code, markdown, HTML, URLs
     clean_text = sanitize_for_speech(clean_text)
@@ -379,7 +388,7 @@ def parse_response(raw: str) -> ParsedResponse:
                           delay_minutes=delay_minutes, delay_keyword=delay_keyword,
                           end_conversation=end_conversation,
                           persist_seconds=persist_seconds, moveto_region=moveto_region,
-                          standing_rule=standing_rule)
+                          standing_rule=standing_rule, query_requests=query_requests)
 
 
 def sanitize_for_speech(text: str) -> str:

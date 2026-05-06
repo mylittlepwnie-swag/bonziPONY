@@ -672,6 +672,42 @@ class Pipeline:
             raw_response = self.llm.chat(user_text)
             logger.info("LLM response: %r", raw_response)
 
+            # QUERY tool handling — execute info queries and do a second LLM pass with results.
+            # LLM emits [QUERY:FILE_TREE:path], [QUERY:CLIPBOARD_HISTORY], [QUERY:READ_NOTEPAD].
+            # We pop the QUERY response from history, run the queries, re-inject results into
+            # the user message, and call LLM again so she can respond with actual information.
+            _query_hits = list(re.finditer(r"\[QUERY:[^\]]+\]", raw_response, re.IGNORECASE))
+            if _query_hits:
+                try:
+                    from core.query_tools import execute_query
+                    # Pop the QUERY exchange from history — we'll replace with a cleaner turn
+                    _hist = getattr(self.llm, "_history", None)
+                    if _hist and len(_hist) >= 2:
+                        _hist.pop()  # assistant QUERY response
+                        _hist.pop()  # user message (re-added below with results)
+                    _result_parts = []
+                    for _qm in _query_hits:
+                        _qtag = _qm.group(0)
+                        logger.info("Executing query: %s", _qtag)
+                        try:
+                            _qresult = execute_query(_qtag)
+                        except Exception as _qexc:
+                            _qresult = f"Error: {_qexc}"
+                        _result_parts.append(f"--- {_qtag} ---\n{_qresult}")
+                    _results_block = "\n\n".join(_result_parts)
+                    _augmented = (
+                        user_text
+                        + f"\n\n[TOOL RESULTS — you requested these via QUERY tags. "
+                        f"Use this information to answer the user naturally. "
+                        f"Do NOT emit QUERY tags again in this response.]\n"
+                        + _results_block
+                        + "\n[/TOOL RESULTS]"
+                    )
+                    raw_response = self.llm.chat(_augmented)
+                    logger.info("LLM post-query response: %r", raw_response)
+                except Exception as _qexc_outer:
+                    logger.warning("Query tool execution failed: %s", _qexc_outer)
+
             # Detect character break — model meta-analyzing the prompt instead of role-playing
             if self._is_character_break(raw_response):
                 # Try stripping the meta preamble first — the in-character part might be fine
