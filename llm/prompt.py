@@ -52,6 +52,34 @@ _DESKTOP_COMMANDS_BLOCK = (
     "Saying 'I shook your screen' without [ACTION:SHAKE] is lying. "
     "Only describe actions you ACTUALLY tagged in your response."
 )
+_QUERY_TOOLS_BLOCK = (
+    "\n\n== QUERY TOOLS (read-only info lookup) ==\n"
+    "These tags let you look up real information from the user's computer. "
+    "Emit the tag in your response — the system will execute it and feed you the results "
+    "so you can answer with actual data. Only use these when the user asks you to check something. "
+    "Do NOT emit a QUERY tag and a full answer in the same response — wait for the result first.\n\n"
+    "File explorer:\n"
+    "  [QUERY:FILE_TREE:C:/Users/John/Desktop] — show directory contents\n"
+    "  [QUERY:FILE_TREE:C:/Users/John/Desktop:2] — same, limit depth to 2 levels\n"
+    "  Result format: each entry has a numbered label.\n"
+    "    [1] means item 1 at the root level (folder shown with /)\n"
+    "    [>1.2] means 2nd item inside folder [1] (one > = one level deep)\n"
+    "    [>>1.2.3] means 3rd item inside [>1.2] (two >> = two levels deep)\n"
+    "  You can reference items by their label: 'that file at [>1.3]'.\n"
+    "  Default depth is 3. If a folder is huge, use a narrower path.\n\n"
+    "Clipboard history (Windows 10+):\n"
+    "  [QUERY:CLIPBOARD_HISTORY] — show everything in the Win+V clipboard history\n"
+    "  Returns up to 25 recent text items, numbered [1] through [25].\n"
+    "  Requires clipboard history to be enabled (Settings > System > Clipboard).\n\n"
+    "Read Notepad:\n"
+    "  [QUERY:READ_NOTEPAD] — read the content of any open Notepad window\n"
+    "  Works with both classic Notepad (Windows 10) and new Notepad (Windows 11).\n"
+    "  Returns the full text. If multiple Notepad windows are open, shows all of them.\n\n"
+    "IMPORTANT: QUERY tags are for READING only — they cannot write or change anything. "
+    "To write to Notepad use [DESKTOP:WRITE_NOTEPAD:...]. "
+    "Only emit ONE type of QUERY per response. Wait for the result before acting on it."
+)
+
 _relationship_mode: str = "lover"
 _relationship_custom: str = ""
 
@@ -161,6 +189,9 @@ def get_system_prompt() -> str:
     # Desktop commands
     text += _DESKTOP_COMMANDS_BLOCK
 
+    # Query tools
+    text += _QUERY_TOOLS_BLOCK
+
     # Identity guard — prevents model from breaking character
     text += _build_identity_guard(display_name)
 
@@ -228,6 +259,9 @@ def get_system_prompt_for(config: PromptConfig) -> str:
 
     # ── Desktop commands ──
     text += _DESKTOP_COMMANDS_BLOCK
+
+    # ── Query tools ──
+    text += _QUERY_TOOLS_BLOCK
 
     # ── Identity guard ──
     text += _build_identity_guard(display_name)
