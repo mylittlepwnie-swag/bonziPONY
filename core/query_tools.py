@@ -8,8 +8,11 @@ and feeds results back so the pony can actually USE the information.
 Supported tags:
   [QUERY:FILE_TREE:path]       — directory tree with numbered entries
   [QUERY:FILE_TREE:path:depth] — same with custom max depth (default 3)
+  [QUERY:READ_FILE:path]       — read a text file silently
   [QUERY:CLIPBOARD_HISTORY]    — Windows 10 clipboard history (Win+V items)
   [QUERY:READ_NOTEPAD]         — text content of open Notepad window(s)
+  [QUERY:PAGE_SOURCE]          — HTML source of the active browser tab
+  [QUERY:PAGE_SOURCE:title]    — HTML source of a tab matching the title
 """
 
 from __future__ import annotations
@@ -52,6 +55,8 @@ def execute_query(query_tag: str) -> str:
         return _file_tree(rest)
     elif qtype == "READ_FILE":
         return _read_file(rest)
+    elif qtype == "PAGE_SOURCE":
+        return _page_source(rest)
     elif qtype == "CLIPBOARD_HISTORY":
         return _clipboard_history()
     elif qtype == "READ_NOTEPAD":
@@ -201,6 +206,161 @@ def _fmt_size(b: int) -> str:
         return f"{b / (1024 ** 2):.1f} MB"
     else:
         return f"{b / (1024 ** 3):.1f} GB"
+
+
+# ── Page source ──────────────────────────────────────────────────────────────
+
+_BROWSER_PROCS = ["chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc"]
+_PAGE_SOURCE_MAX_CHARS = 12_000
+
+# PowerShell: find browser windows and extract URL from address bar via UIA
+_PS_GET_BROWSER_URLS = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$scope  = [System.Windows.Automation.TreeScope]::Children
+$descScope = [System.Windows.Automation.TreeScope]::Descendants
+$editType = [System.Windows.Automation.ControlType]::Edit
+$browsers = @("chrome","msedge","firefox","brave","opera","vivaldi","arc")
+$results = @()
+foreach ($name in $browsers) {
+    $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+    foreach ($proc in $procs) {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
+        $wins = $root.FindAll($scope, $cond)
+        foreach ($win in $wins) {
+            $title = $win.Current.Name
+            if (-not $title) { continue }
+            $editCond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $editType)
+            $edits = $win.FindAll($descScope, $editCond)
+            foreach ($edit in $edits) {
+                try {
+                    $vp = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                    $val = $vp.Current.Value
+                    if ($val -match "^https?://") {
+                        $results += "BROWSER=$name|TITLE=$title|URL=$val"
+                        break
+                    }
+                } catch {}
+            }
+        }
+    }
+}
+if ($results.Count -eq 0) { "NONE" } else { $results -join "`n" }
+"""
+
+
+def _page_source(target: str) -> str:
+    """Fetch the HTML source of a browser tab, optionally matched by title."""
+    target = target.strip()
+
+    # Get URLs from all open browser windows
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_GET_BROWSER_URLS],
+            capture_output=True, text=True, timeout=15,
+        )
+        raw = proc.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "Browser URL lookup timed out."
+    except FileNotFoundError:
+        return "PowerShell not available."
+    except Exception as exc:
+        return f"Browser lookup failed: {exc}"
+
+    if not raw or raw == "NONE":
+        return (
+            "No browser window found. "
+            "Make sure Chrome, Edge, Firefox, or Brave is open."
+        )
+
+    # Parse the results
+    tabs: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = {}
+        for chunk in line.split("|"):
+            if "=" in chunk:
+                k, _, v = chunk.partition("=")
+                parts[k.strip()] = v.strip()
+        if "URL" in parts and "TITLE" in parts:
+            tabs.append(parts)
+
+    if not tabs:
+        return "Could not extract URLs from browser windows."
+
+    # Pick the right tab
+    if target:
+        tl = target.lower()
+        match = next(
+            (t for t in tabs if tl in t["TITLE"].lower() or tl in t["URL"].lower()),
+            None,
+        )
+        if match is None:
+            available = "\n".join(f"  - {t['TITLE']} ({t['URL'][:60]})" for t in tabs[:10])
+            return f"No tab matching '{target}' found. Open tabs:\n{available}"
+    else:
+        # No target — use the first (most recently active) tab found
+        match = tabs[0]
+
+    url = match["URL"]
+    title = match["TITLE"]
+
+    # Fetch the page
+    return _fetch_and_clean(url, title)
+
+
+def _fetch_and_clean(url: str, title: str) -> str:
+    """Fetch a URL and return cleaned source suitable for LLM reading."""
+    import re as _re
+    import urllib.request
+    import urllib.error
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            # Only read text content types
+            ctype = resp.headers.get("Content-Type", "")
+            if "text" not in ctype and "json" not in ctype:
+                return f"Page at '{title}' has non-text content type ({ctype}). Can't read source."
+            raw_html = resp.read(500_000).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code} fetching {url}"
+    except urllib.error.URLError as exc:
+        return f"Could not fetch page: {exc.reason}"
+    except Exception as exc:
+        return f"Fetch failed: {exc}"
+
+    # Strip <script> blocks
+    cleaned = _re.sub(r"<script\b[^>]*>.*?</script>", "", raw_html, flags=_re.DOTALL | _re.IGNORECASE)
+    # Strip <style> blocks
+    cleaned = _re.sub(r"<style\b[^>]*>.*?</style>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
+    # Strip HTML comments
+    cleaned = _re.sub(r"<!--.*?-->", "", cleaned, flags=_re.DOTALL)
+    # Collapse whitespace runs
+    cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = _re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = cleaned.strip()
+
+    truncated = False
+    if len(cleaned) > _PAGE_SOURCE_MAX_CHARS:
+        cleaned = cleaned[:_PAGE_SOURCE_MAX_CHARS]
+        truncated = True
+
+    header = f"=== PAGE SOURCE: {title} ===\nURL: {url}\n\n"
+    footer = "\n\n... (truncated — source continues beyond this point)" if truncated else ""
+    return header + cleaned + footer
 
 
 # ── Clipboard history ─────────────────────────────────────────────────────────
