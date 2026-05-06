@@ -50,12 +50,62 @@ def execute_query(query_tag: str) -> str:
 
     if qtype == "FILE_TREE":
         return _file_tree(rest)
+    elif qtype == "READ_FILE":
+        return _read_file(rest)
     elif qtype == "CLIPBOARD_HISTORY":
         return _clipboard_history()
     elif qtype == "READ_NOTEPAD":
         return _read_notepad()
     else:
         return f"[Unknown query type: {qtype}]"
+
+
+# ── Read file ─────────────────────────────────────────────────────────────────
+
+_ALLOWED_EXTENSIONS = {".txt", ".md", ".json", ".yaml", ".yml", ".ini", ".cfg", ".toml", ".csv", ".log"}
+_MAX_FILE_CHARS = 8000
+
+
+def _read_file(path_str: str) -> str:
+    """Read a text file and return its contents. Restricted to safe extensions."""
+    path_str = path_str.strip().strip("\"'")
+    if not path_str:
+        return "No path provided."
+
+    p = Path(path_str)
+
+    if not p.exists():
+        return f"File not found: {path_str}"
+    if p.is_dir():
+        return f"That's a directory, not a file. Use [QUERY:FILE_TREE:{path_str}] to explore it."
+
+    ext = p.suffix.lower()
+    if ext not in _ALLOWED_EXTENSIONS:
+        return (
+            f"Can't read {p.name} — extension '{ext}' not allowed. "
+            f"Readable types: {', '.join(sorted(_ALLOWED_EXTENSIONS))}"
+        )
+
+    try:
+        size = p.stat().st_size
+        if size > 500_000:
+            return f"File too large to read ({_fmt_size(size)}). Max ~500 KB."
+
+        text = p.read_text(encoding="utf-8", errors="replace")
+
+        truncated = False
+        if len(text) > _MAX_FILE_CHARS:
+            text = text[:_MAX_FILE_CHARS]
+            truncated = True
+
+        header = f"=== {p.name} ({_fmt_size(size)}) ==="
+        footer = f"\n... (truncated at {_MAX_FILE_CHARS} chars — file continues)" if truncated else ""
+        return f"{header}\n{text}{footer}"
+
+    except PermissionError:
+        return f"Permission denied reading {p.name}."
+    except Exception as exc:
+        return f"Error reading {p.name}: {exc}"
 
 
 # ── File tree ─────────────────────────────────────────────────────────────────
