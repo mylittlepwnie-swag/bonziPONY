@@ -1,0 +1,56 @@
+# ══════════════════════════════════════════════════════════════
+# Desktop Ponies v1.69 — Full dependency list
+# Install all:  pip install -r requirements.txt
+# ══════════════════════════════════════════════════════════════
+
+# ── Core GUI ──────────────────────────────────────────────────
+PyQt5>=5.15.0
+Pillow>=10.0.0
+
+# ── Wake word detection ───────────────────────────────────────
+pvporcupine>=3.0.0
+pvrecorder>=1.2.0
+
+# ── Speech-to-text (STT) ─────────────────────────────────────
+SpeechRecognition>=3.10.0       # Google Web Speech API + mic input
+PyAudioWPatch>=0.2.12          # prebuilt fork — avoids needing C++ build tools
+openai-whisper>=20230314
+webrtcvad-wheels>=2.0.11        # prebuilt — avoids needing C++ build tools
+
+# ── Misc scientific (used by whisper, transformers, etc.) ─────
+scipy>=1.10.0
+
+# ── Text-to-speech (TTS) ─────────────────────────────────────
+elevenlabs>=1.0.0
+sounddevice>=0.4.6
+soundfile>=0.12.1
+
+# ── LLM providers ────────────────────────────────────────────
+anthropic>=0.20.0
+openai>=1.14.0
+
+# ── Vision / screen ──────────────────────────────────────────
+opencv-python>=4.8.0
+mss>=9.0.0
+
+# ── CLIP watch mode (optional — scene understanding + OCR) ───
+transformers>=4.30.0
+torch>=2.0.0
+winocr>=0.0.6                   # Windows-only OCR
+
+# ── Desktop automation ────────────────────────────────────────
+pyautogui>=0.9.54
+pygetwindow>=0.0.9
+pywin32>=306                    # win32gui, win32con, etc.
+
+# ── Input / hotkeys ──────────────────────────────────────────
+pynput>=1.7.0                  # global hotkey detection (push-to-talk, no admin needed)
+
+# ── Config / utilities ────────────────────────────────────────
+PyYAML>=6.0.1
+numpy>=1.24.0
+
+# ── Data bank (semantic vector search over knowledge/ notes) ──
+# Downloads a small local embedding model (~80 MB) on first run.
+# If absent/offline, the data bank falls back to keyword search.
+sentence-transformers>=2.2.0

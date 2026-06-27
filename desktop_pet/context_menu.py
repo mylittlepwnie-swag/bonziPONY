@@ -1,0 +1,2145 @@
+"""Right-click context menu — full in-app settings UI."""
+
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import time
+from pathlib import Path
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
+
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import (
+    QAction, QActionGroup, QApplication, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMenu, QMessageBox, QProgressDialog, QPushButton, QSpinBox, QTextEdit,
+    QVBoxLayout, QWidget,
+)
+
+if TYPE_CHECKING:
+    from core.config_loader import AppConfig
+    from core.agent_loop import AgentLoop
+    from llm.base import LLMProvider
+
+logger = logging.getLogger(__name__)
+
+
+# ── YAML persistence (line-level, preserves comments) ──────────────────────
+
+def _save_yaml_value(key_path: str, value, config_path: str = "config.yaml") -> None:
+    """Update a single section.key value in config.yaml preserving comments.
+
+    If the section or key doesn't exist yet, it will be appended so that
+    new config keys (like ``tts.provider``) persist across restarts.
+    """
+    try:
+        path = Path(config_path).resolve()
+        if not path.exists():
+            logger.warning("Config file not found for save: %s", path)
+            return
+        lines = path.read_text(encoding="utf-8").splitlines(True)
+
+        parts = key_path.split(".")
+        if len(parts) not in (1, 2):
+            return
+
+        # Format value for YAML
+        if value is None:
+            yaml_val = "null"
+        elif isinstance(value, bool):
+            yaml_val = "true" if value else "false"
+        elif isinstance(value, str):
+            yaml_val = f'"{value}"'
+        elif isinstance(value, (int, float)):
+            yaml_val = str(value)
+        else:
+            yaml_val = str(value)
+
+        # Top-level single key (e.g. "auto_update")
+        if len(parts) == 1:
+            top_key = parts[0]
+            for i, line in enumerate(lines):
+                stripped = line.lstrip()
+                if stripped.startswith(f"{top_key}:") and not line.startswith((" ", "\t")):
+                    lines[i] = f"{top_key}: {yaml_val}\n"
+                    break
+            else:
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.append(f"{top_key}: {yaml_val}\n")
+            path.write_text("".join(lines), encoding="utf-8")
+            return
+
+        section, key = parts
+
+        in_section = False
+        section_found = False
+        section_end = -1  # line index right after the last line in the section
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+
+            # Entering target section?
+            if not stripped.startswith("#") and (stripped == f"{section}:" or stripped.startswith(f"{section}:")):
+                in_section = True
+                section_found = True
+                continue
+
+            # Left section? (next top-level key)
+            if in_section and stripped and not line[0].isspace() and ":" in stripped:
+                section_end = i
+                in_section = False
+                continue
+
+            # Found our key inside the section
+            if in_section and stripped.startswith(f"{key}:"):
+                indent = len(line) - len(line.lstrip())
+                prefix = " " * indent + f"{key}: "
+
+                # Preserve inline comment (# preceded by whitespace, not inside quotes)
+                comment = ""
+                # Find # that's preceded by whitespace and not inside quotes
+                in_quote = False
+                quote_char = None
+                comment_idx = -1
+                for ci, ch in enumerate(line):
+                    if ch in ('"', "'") and not in_quote:
+                        in_quote = True
+                        quote_char = ch
+                    elif ch == quote_char and in_quote:
+                        in_quote = False
+                        quote_char = None
+                    elif ch == '#' and not in_quote and ci > 0 and line[ci-1] in (' ', '\t'):
+                        comment_idx = ci
+                        break
+                if comment_idx > 0 and comment_idx > len(prefix):
+                    comment = line[comment_idx:].rstrip("\n")
+                    new_line = f"{prefix}{yaml_val}"
+                    pad = max(1, comment_idx - len(new_line))
+                    lines[i] = new_line + " " * pad + comment + "\n"
+                else:
+                    lines[i] = f"{prefix}{yaml_val}\n"
+                break
+        else:
+            # Key not found — need to add it
+            if section_found:
+                # Section exists but key doesn't — insert at section boundary
+                insert_pos = section_end if section_end >= 0 else len(lines)
+                lines.insert(insert_pos, f"  {key}: {yaml_val}\n")
+            else:
+                # Section doesn't exist — append section + key
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.append(f"\n{section}:\n  {key}: {yaml_val}\n")
+
+        path.write_text("".join(lines), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to save config %s: %s", key_path, exc)
+
+
+def _save_yaml_list(key_path: str, values: list, config_path: str = "config.yaml") -> None:
+    """Save a list value (like api_keys) to config.yaml, replacing any existing list."""
+    try:
+        path = Path(config_path).resolve()
+        if not path.exists():
+            logger.warning("Config file not found for list save: %s", path)
+            return
+        lines = path.read_text(encoding="utf-8").splitlines(True)
+
+        parts = key_path.split(".")
+        if len(parts) != 2:
+            return
+        section, key = parts
+
+        in_section = False
+        found_key = False
+        key_line = -1
+        # Track lines belonging to the old list (- "item" lines after the key)
+        list_start = -1
+        list_end = -1
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+
+            if not stripped.startswith("#") and (stripped == f"{section}:" or stripped.startswith(f"{section}:")):
+                in_section = True
+                continue
+
+            if in_section and stripped and not line[0].isspace() and ":" in stripped:
+                in_section = False
+                continue
+
+            if in_section and stripped.startswith(f"{key}:"):
+                key_line = i
+                found_key = True
+                # Check if it's an inline list like "api_keys: []"
+                after_colon = stripped[len(key) + 1:].strip()
+                if after_colon.startswith("["):
+                    # Inline list — just replace the whole line
+                    break
+                # Block list — find the extent of "- item" lines
+                list_start = i + 1
+                list_end = i + 1
+                for j in range(i + 1, len(lines)):
+                    sj = lines[j].strip()
+                    if sj.startswith("- "):
+                        list_end = j + 1
+                    elif sj == "" or sj.startswith("#"):
+                        continue  # skip blank/comment lines within list
+                    else:
+                        break
+                break
+
+        if not found_key:
+            # Key doesn't exist — find section and insert
+            in_sec = False
+            sec_end = len(lines)
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if not stripped.startswith("#") and (stripped == f"{section}:" or stripped.startswith(f"{section}:")):
+                    in_sec = True
+                    continue
+                if in_sec and stripped and not line[0].isspace() and ":" in stripped:
+                    sec_end = i
+                    break
+            if in_sec or sec_end < len(lines):
+                # Section exists — insert key + list items at section boundary
+                new_lines = [f"  {key}:\n"]
+                for v in values:
+                    new_lines.append(f'    - "{v}"\n')
+                for nl in reversed(new_lines):
+                    lines.insert(sec_end, nl)
+            else:
+                # Section doesn't exist — append
+                if lines and not lines[-1].endswith("\n"):
+                    lines[-1] += "\n"
+                lines.append(f"\n{section}:\n  {key}:\n")
+                for v in values:
+                    lines.append(f'    - "{v}"\n')
+            path.write_text("".join(lines), encoding="utf-8")
+            return
+
+        indent = len(lines[key_line]) - len(lines[key_line].lstrip())
+        item_indent = " " * (indent + 2)
+
+        if not values:
+            # Empty list
+            lines[key_line] = " " * indent + f"{key}: []\n"
+            if list_start >= 0 and list_end > list_start:
+                del lines[list_start:list_end]
+        else:
+            # Write as block list
+            lines[key_line] = " " * indent + f"{key}:\n"
+            new_items = [f'{item_indent}- "{v}"\n' for v in values]
+            if list_start >= 0 and list_end > list_start:
+                lines[list_start:list_end] = new_items
+            else:
+                for idx, item in enumerate(new_items):
+                    lines.insert(key_line + 1 + idx, item)
+
+        path.write_text("".join(lines), encoding="utf-8")
+    except Exception as exc:
+        logger.warning("Failed to save config list %s: %s", key_path, exc)
+
+
+# ── Audio device enumeration ───────────────────────────────────────────────
+
+def _list_audio_devices() -> List[Tuple[int, str, bool]]:
+    """List audio devices via PyAudio. Returns [(index, name, is_input), ...]."""
+    try:
+        import pyaudio
+        pa = pyaudio.PyAudio()
+        devices = []
+        seen = set()
+        for i in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(i)
+            name = info.get("name", f"Device {i}")
+            max_in = info.get("maxInputChannels", 0)
+            max_out = info.get("maxOutputChannels", 0)
+            if max_in > 0:
+                key = (name, True)
+                if key not in seen:
+                    seen.add(key)
+                    devices.append((i, name, True))
+            if max_out > 0:
+                key = (name, False)
+                if key not in seen:
+                    seen.add(key)
+                    devices.append((i, name, False))
+        pa.terminate()
+        return devices
+    except Exception:
+        return []
+
+
+# ── Dialogs ────────────────────────────────────────────────────────────────
+
+class _DirectivesDialog(QDialog):
+    """Shows current active directives with remove capability."""
+
+    def __init__(self, agent_loop: AgentLoop, parent=None):
+        super().__init__(parent)
+        self._agent_loop = agent_loop
+        self.setWindowTitle("Active Directives")
+        self.setMinimumWidth(450)
+        self.setMinimumHeight(250)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        layout = QVBoxLayout(self)
+
+        self._list = QListWidget()
+        self._refresh()
+        layout.addWidget(self._list)
+
+        btn_row = QHBoxLayout()
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(self._remove_selected)
+        btn_row.addWidget(remove_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _refresh(self):
+        self._list.clear()
+        if not self._agent_loop.directives:
+            item = QListWidgetItem("No active directives.")
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            self._list.addItem(item)
+            return
+        for i, d in enumerate(self._agent_loop.directives):
+            age = time.monotonic() - d.created_at
+            if age < 60:
+                age_str = f"{age:.0f}s"
+            elif age < 3600:
+                age_str = f"{age / 60:.0f}m"
+            else:
+                age_str = f"{age / 3600:.1f}h"
+            timer = f"  timer:{d.trigger_time}" if d.trigger_time else ""
+            fired = " FIRED" if d.triggered else ""
+            text = f"[{d.urgency}/10] {d.goal}  ({d.source}, {age_str}{timer}{fired})"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, i)
+            self._list.addItem(item)
+
+    def _remove_selected(self):
+        item = self._list.currentItem()
+        if item is None:
+            return
+        idx = item.data(Qt.UserRole)
+        if idx is not None and 0 <= idx < len(self._agent_loop.directives):
+            self._agent_loop.directives.pop(idx)
+            self._refresh()
+
+
+class _AddDirectiveDialog(QDialog):
+    """Simple dialog to add a directive with goal + urgency."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Directive")
+        self.setMinimumWidth(380)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        layout = QVBoxLayout(self)
+
+        from llm.prompt import get_character_name
+        layout.addWidget(QLabel(f"What should {get_character_name()} nag you about?"))
+        tip = QLabel(f"(Tip: You can also just ask {get_character_name()} directly in conversation!)")
+        tip.setStyleSheet("color: gray; font-size: 11px; font-style: italic;")
+        layout.addWidget(tip)
+        self._goal = QLineEdit()
+        self._goal.setPlaceholderText("e.g. Go eat food, Do homework, Go to sleep...")
+        layout.addWidget(self._goal)
+
+        urg_row = QHBoxLayout()
+        urg_row.addWidget(QLabel("Urgency (1=chill, 10=nuclear):"))
+        self._urgency = QSpinBox()
+        self._urgency.setRange(1, 10)
+        self._urgency.setValue(5)
+        urg_row.addWidget(self._urgency)
+        layout.addLayout(urg_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_values(self) -> Tuple[str, int]:
+        return self._goal.text().strip(), self._urgency.value()
+
+
+# ── Routines dialogs ────────────────────────────────────────────────────
+
+class _RoutinesDialog(QDialog):
+    """Shows recurring routines with add/remove."""
+
+    def __init__(self, agent_loop: "AgentLoop", parent=None):
+        super().__init__(parent)
+        from core.routines import RoutineManager
+        self._agent_loop = agent_loop
+        self._rm: RoutineManager = agent_loop.routine_manager
+        self.setWindowTitle("Recurring Routines")
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(300)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        layout = QVBoxLayout(self)
+
+        wake_info = self._rm.wake_time
+        if wake_info:
+            h = self._rm.hours_since_wake
+            info = QLabel(f"Last wake-up: {wake_info.strftime('%I:%M %p')} ({h:.1f}h ago)")
+            info.setStyleSheet("color: gray; font-style: italic;")
+            layout.addWidget(info)
+
+        self._list = QListWidget()
+        self._refresh()
+        layout.addWidget(self._list)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add Routine...")
+        add_btn.clicked.connect(lambda: self._add_routine())
+        btn_row.addWidget(add_btn)
+        remove_btn = QPushButton("Remove Selected")
+        remove_btn.clicked.connect(self._remove_selected)
+        btn_row.addWidget(remove_btn)
+        toggle_btn = QPushButton("Enable/Disable")
+        toggle_btn.clicked.connect(self._toggle_selected)
+        btn_row.addWidget(toggle_btn)
+        btn_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _refresh(self):
+        self._list.clear()
+        if not self._rm.routines:
+            item = QListWidgetItem("No routines set up. Click 'Add Routine...' to create one.")
+            item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+            self._list.addItem(item)
+            return
+        for r in self._rm.routines:
+            desc = self._rm.describe_routine(r)
+            status = "" if r.enabled else " [DISABLED]"
+            last = f"  (last: {r.last_fired_date})" if r.last_fired_date else ""
+            text = f"[{r.urgency}/10] {r.goal}  —  {desc}{last}{status}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, r.id)
+            self._list.addItem(item)
+
+    def _remove_selected(self):
+        item = self._list.currentItem()
+        if item is None:
+            return
+        rid = item.data(Qt.UserRole)
+        if rid:
+            self._rm.remove(rid)
+            self._refresh()
+
+    def _toggle_selected(self):
+        item = self._list.currentItem()
+        if item is None:
+            return
+        rid = item.data(Qt.UserRole)
+        if rid:
+            self._rm.toggle(rid)
+            self._refresh()
+
+    def _add_routine(self):
+        dlg = _AddRoutineDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            routine = dlg.get_routine()
+            if routine:
+                self._rm.add(routine)
+                self._refresh()
+
+
+class _AddRoutineDialog(QDialog):
+    """Dialog to create a new recurring routine."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Routine")
+        self.setMinimumWidth(420)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        layout = QVBoxLayout(self)
+
+        from llm.prompt import get_character_name
+        layout.addWidget(QLabel(f"What should {get_character_name()} remind you about?"))
+        self._goal = QLineEdit()
+        self._goal.setPlaceholderText("e.g. Brush your teeth, Drink water, Take meds...")
+        layout.addWidget(self._goal)
+
+        # Schedule type
+        sched_row = QHBoxLayout()
+        sched_row.addWidget(QLabel("Schedule:"))
+        self._schedule = QComboBox()
+        self._schedule.addItems([
+            "on_wake — When I wake up",
+            "on_sleep — Before bed (~Xh after waking)",
+            "daily — Every day at a specific time",
+            "weekly — Once a week at a day+time",
+            "interval — Every X hours",
+        ])
+        self._schedule.currentIndexChanged.connect(self._on_schedule_changed)
+        sched_row.addWidget(self._schedule)
+        layout.addLayout(sched_row)
+
+        # Time input (for daily/weekly)
+        time_row = QHBoxLayout()
+        time_row.addWidget(QLabel("Time (HH:MM, 24h):"))
+        self._time = QLineEdit()
+        self._time.setPlaceholderText("e.g. 14:00")
+        self._time.setMaximumWidth(80)
+        time_row.addWidget(self._time)
+        time_row.addStretch()
+        layout.addLayout(time_row)
+        self._time_row_widgets = [self._time]
+
+        # Day input (for weekly)
+        day_row = QHBoxLayout()
+        day_row.addWidget(QLabel("Day:"))
+        self._day = QComboBox()
+        self._day.addItems(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])
+        day_row.addWidget(self._day)
+        day_row.addStretch()
+        layout.addLayout(day_row)
+        self._day_widget = self._day
+
+        # Hours input (for interval / on_sleep)
+        hours_row = QHBoxLayout()
+        self._hours_label = QLabel("Hours after waking:")
+        hours_row.addWidget(self._hours_label)
+        self._hours = QDoubleSpinBox()
+        self._hours.setRange(0.5, 24.0)
+        self._hours.setValue(8.0)
+        self._hours.setSingleStep(0.5)
+        hours_row.addWidget(self._hours)
+        hours_row.addStretch()
+        layout.addLayout(hours_row)
+
+        # Urgency
+        urg_row = QHBoxLayout()
+        urg_row.addWidget(QLabel("Urgency (1=chill, 10=nuclear):"))
+        self._urgency = QSpinBox()
+        self._urgency.setRange(1, 10)
+        self._urgency.setValue(5)
+        urg_row.addWidget(self._urgency)
+        layout.addLayout(urg_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._on_schedule_changed(0)  # initial visibility
+
+    def _on_schedule_changed(self, idx: int):
+        sched = self._schedule.currentText().split(" — ")[0]
+        self._time.setVisible(sched in ("daily", "weekly"))
+        self._day_widget.setVisible(sched == "weekly")
+        self._hours.setVisible(sched in ("on_sleep", "interval"))
+        self._hours_label.setVisible(sched in ("on_sleep", "interval"))
+        if sched == "on_sleep":
+            self._hours_label.setText("Hours after waking:")
+            self._hours.setValue(8.0)
+        elif sched == "interval":
+            self._hours_label.setText("Every X hours:")
+            self._hours.setValue(2.0)
+
+    def get_routine(self):
+        from core.routines import Routine
+        import uuid
+        goal = self._goal.text().strip()
+        if not goal:
+            return None
+        sched = self._schedule.currentText().split(" — ")[0]
+        return Routine(
+            id=str(uuid.uuid4())[:8],
+            goal=goal,
+            urgency=self._urgency.value(),
+            schedule=sched,
+            time=self._time.text().strip() or None,
+            day=self._day.currentText() if sched == "weekly" else None,
+            interval_hours=self._hours.value() if sched == "interval" else None,
+            sleep_offset_hours=self._hours.value() if sched == "on_sleep" else 8.0,
+        )
+
+
+# ── Context menu builder ──────────────────────────────────────────────────
+
+class _CharacterPickerDialog(QDialog):
+    """Searchable dialog to pick from all available characters."""
+
+    def __init__(self, current_slug: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Character")
+        self.setMinimumWidth(350)
+        self.setMinimumHeight(500)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        self._selected_slug: Optional[str] = None
+
+        layout = QVBoxLayout(self)
+
+        layout.addWidget(QLabel("Choose a character:"))
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search characters...")
+        self._search.textChanged.connect(self._filter)
+        layout.addWidget(self._search)
+
+        self._list = QListWidget()
+        self._list.itemDoubleClicked.connect(self._on_double_click)
+        layout.addWidget(self._list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # Populate
+        from core.character_registry import get_all_characters
+        self._all_chars = get_all_characters()
+        self._populate(current_slug)
+
+    def _populate(self, current_slug: str) -> None:
+        self._list.clear()
+        scroll_to: Optional[QListWidgetItem] = None
+        for info in self._all_chars:
+            label = info.display_name
+            if info.has_custom_preset:
+                label += "  \u2605"  # star for custom presets
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, info.slug)
+            self._list.addItem(item)
+            if info.slug == current_slug:
+                item.setSelected(True)
+                scroll_to = item
+        if scroll_to:
+            self._list.setCurrentItem(scroll_to)
+            self._list.scrollToItem(scroll_to)
+
+    def _filter(self, text: str) -> None:
+        text_lower = text.lower()
+        for i in range(self._list.count()):
+            item = self._list.item(i)
+            item.setHidden(text_lower not in item.text().lower())
+
+    def _on_double_click(self, item: QListWidgetItem) -> None:
+        self._selected_slug = item.data(Qt.UserRole)
+        self.accept()
+
+    def _on_accept(self) -> None:
+        item = self._list.currentItem()
+        if item and not item.isHidden():
+            self._selected_slug = item.data(Qt.UserRole)
+            self.accept()
+
+    def get_selected_slug(self) -> Optional[str]:
+        return self._selected_slug
+
+
+class _OOCDialog(QDialog):
+    """Dialog to send an out-of-character message to the LLM."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        from llm.prompt import get_character_name
+        self.setWindowTitle(f"OOC Message to {get_character_name()}")
+        self.setMinimumWidth(450)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+
+        layout = QVBoxLayout(self)
+
+        info = QLabel(
+            "Send an out-of-character instruction to the LLM.\n"
+            "Use this to critique writing style, fix mistakes, adjust behavior, etc.\n"
+            "The character will read this as a meta-instruction, not as dialogue."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: gray; font-style: italic;")
+        layout.addWidget(info)
+
+        self._text = QLineEdit()
+        self._text.setPlaceholderText("e.g. Stop using so many exclamation marks, be more sarcastic...")
+        layout.addWidget(self._text)
+
+        self._response = QLabel("")
+        self._response.setWordWrap(True)
+        self._response.setStyleSheet("padding: 6px; background: #1a1a2e; border-radius: 4px;")
+        self._response.hide()
+        layout.addWidget(self._response)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_text(self) -> str:
+        return self._text.text().strip()
+
+
+class ContextMenuBuilder:
+    """Holds live-object references and builds the right-click menu on demand."""
+
+    def __init__(
+        self,
+        config: AppConfig,
+        config_path: str = "config.yaml",
+        agent_loop: Optional[AgentLoop] = None,
+        llm_provider: Optional[LLMProvider] = None,
+        on_scale_change: Optional[Callable[[float], None]] = None,
+        on_character_change: Optional[Callable[[str], None]] = None,
+        on_quit: Optional[Callable[[], None]] = None,
+        ack_player=None,
+        on_provider_change: Optional[Callable[[str], None]] = None,
+        tts=None,
+        vision_llm=None,
+        on_vision_llm_change: Optional[Callable[[], None]] = None,
+        pony_manager=None,
+        pony_instance=None,
+        transcriber=None,
+    ) -> None:
+        self.config = config
+        self.config_path = str(Path(config_path).resolve())
+        self.agent_loop = agent_loop
+        self.llm = llm_provider
+        self.on_scale_change = on_scale_change
+        self.on_character_change = on_character_change
+        self.on_quit = on_quit
+        self.ack_player = ack_player
+        self.on_provider_change = on_provider_change
+        self.tts = tts
+        self.vision_llm = vision_llm
+        self.on_vision_llm_change = on_vision_llm_change
+        self.pony_manager = pony_manager      # PonyManager or None
+        self.pony_instance = pony_instance    # which PonyInstance this menu belongs to
+        self.transcriber = transcriber        # for speaker verification enrollment
+
+    # ── Main builder ──────────────────────────────────────────────────────
+
+    def build(self, parent: QWidget) -> QMenu:
+        """Build and return the full context menu."""
+        menu = QMenu(parent)
+        cfg = self.config
+
+        # ── Secondary pony: lightweight menu ──────────────────────────
+        inst = self.pony_instance
+        if inst and not inst.is_primary:
+            return self._build_secondary_menu(menu, parent)
+
+        # ── Read-Only / Auto-Update toggles (prominent, top of menu) ──
+        _ro_on = bool(getattr(cfg.safety, "read_only_mode", False))
+        _ro_label = ("🟢 Read-Only Mode: ON" if _ro_on
+                     else "🔴 Read-Only Mode: OFF")
+        ro_act = menu.addAction(_ro_label)
+        ro_act.setCheckable(True)
+        ro_act.setChecked(_ro_on)
+        ro_act.triggered.connect(lambda c: self._set_read_only(c, parent))
+
+        _au_on = bool(getattr(cfg, "auto_update", False))
+        _au_label = ("🟢 Auto-Update: ON" if _au_on
+                     else "🔴 Auto-Update: OFF")
+        au_act = menu.addAction(_au_label)
+        au_act.setCheckable(True)
+        au_act.setChecked(_au_on)
+        au_act.triggered.connect(lambda c: self._set_auto_update(c))
+
+        # Pixel font toggle — prominent so it's findable (used to be buried
+        # under Features and users couldn't find it)
+        _pf_on = getattr(cfg.desktop_pet, "font_style", "default") == "m5x7"
+        _pf_label = ("🟢 Pixel Font: ON" if _pf_on
+                     else "🔴 Pixel Font: OFF")
+        pf_act = menu.addAction(_pf_label)
+        pf_act.setCheckable(True)
+        pf_act.setChecked(_pf_on)
+        pf_act.triggered.connect(
+            lambda c: self._set_font_style("m5x7" if c else "default")
+        )
+
+        menu.addSeparator()
+
+        # ── Directives submenu ────────────────────────────────────────
+        dir_menu = menu.addMenu("Directives")
+
+        view_act = dir_menu.addAction("View Active...")
+        view_act.triggered.connect(lambda: self._show_directives(parent))
+
+        clear_act = dir_menu.addAction("Clear All")
+        clear_act.triggered.connect(self._clear_directives)
+        has = self.agent_loop and self.agent_loop.has_directives
+        clear_act.setEnabled(bool(has))
+
+        add_act = dir_menu.addAction("Add Directive...")
+        add_act.triggered.connect(lambda: self._add_directive(parent))
+        add_act.setEnabled(self.agent_loop is not None)
+
+        routines_act = dir_menu.addAction("Routines...")
+        routines_act.triggered.connect(lambda: self._show_routines(parent))
+        routines_act.setEnabled(self.agent_loop is not None)
+
+        ooc_act = menu.addAction("Send OOC Message...")
+        ooc_act.triggered.connect(lambda: self._send_ooc(parent))
+
+        menu.addSeparator()
+
+        # ── Conversation Only mode ────────────────────────────────────
+        is_convo_only = (
+            not cfg.agent.enabled
+            and not cfg.agent.self_initiate
+            and not cfg.desktop_control.enabled
+            and not cfg.vision.screen_capture
+            and not cfg.vision.enabled
+        )
+        self._add_toggle(menu, "Conversation Only", is_convo_only,
+                         lambda c: self._set_conversation_only(c))
+
+        menu.addSeparator()
+
+        # ── Features toggles submenu ──────────────────────────────────
+        feat_menu = menu.addMenu("Features")
+
+        self._add_toggle(feat_menu, "Autonomous Mode", cfg.agent.enabled,
+                         lambda c: self._set("agent", "enabled", c))
+        self._add_toggle(feat_menu, "Self-Initiate", cfg.agent.self_initiate,
+                         lambda c: self._set("agent", "self_initiate", c))
+        self._add_toggle(feat_menu, "Desktop Control", cfg.desktop_control.enabled,
+                         lambda c: self._set("desktop_control", "enabled", c))
+        self._add_toggle(feat_menu, "Wake Word", cfg.wake_word.enabled,
+                         lambda c: self._set("wake_word", "enabled", c))
+        self._add_toggle(feat_menu, "TTS (Voice)", cfg.tts.enabled,
+                         lambda c: self._set("tts", "enabled", c))
+        self._add_toggle(feat_menu, "Speech Bubbles", cfg.desktop_pet.speech_bubble,
+                         lambda c: self._set("desktop_pet", "speech_bubble", c))
+        self._add_toggle(
+            feat_menu,
+            "Pixel Font (m5x7)",
+            getattr(cfg.desktop_pet, "font_style", "default") == "m5x7",
+            lambda c: self._set_font_style("m5x7" if c else "default"),
+        )
+        self._add_toggle(
+            feat_menu,
+            "Typewriter Sound",
+            getattr(cfg.desktop_pet, "typewriter_sound", True),
+            lambda c: self._set_typewriter_sound(c),
+        )
+
+        feat_menu.addSeparator()
+
+        self._add_toggle(feat_menu, "Screenshots", cfg.vision.screen_capture,
+                         lambda c: self._set("vision", "screen_capture", c))
+        self._add_toggle(feat_menu, "Webcam", cfg.vision.enabled,
+                         lambda c: self._set("vision", "enabled", c))
+        self._radio_submenu(feat_menu, "Screen Vision", [
+            ("API (LLM)", "api"),
+            ("Moondream (Local)", "moondream"),
+        ], cfg.vision.screen_vision, lambda v: self._set_screen_vision(v))
+
+        menu.addSeparator()
+
+        # ── Activity Level submenu (scales ALL timing) ────────────────
+        self._radio_submenu(menu, "Activity Level", [
+            ("Hyper (30s)", 0.10),
+            ("Fast (2 min)", 0.40),
+            ("Normal (5 min)", 1.00),
+            ("Relaxed (12 min)", 2.50),
+            ("Chill (30 min)", 6.00),
+        ], cfg.agent.activity_multiplier,
+            lambda v: self._set_activity_level(v))
+
+        # ── Scale submenu ─────────────────────────────────────────────
+        self._radio_submenu(menu, "Scale", [
+            ("Tiny (1x)", 1.0),
+            ("Normal (2x)", 2.0),
+            ("Big (3x)", 3.0),
+            ("Huge (4x)", 4.0),
+        ], cfg.desktop_pet.scale,
+            lambda v: self._apply_scale(v))
+
+        # ── LLM Provider submenu ──────────────────────────────────────
+        llm_menu = menu.addMenu("LLM Provider")
+        self._radio_submenu_into(llm_menu, [
+            ("OpenAI", "openai"),
+            ("Anthropic (Claude)", "anthropic"),
+            ("Ollama (local)", "ollama"),
+            ("LM Studio (local)", "lmstudio"),
+            ("OpenRouter", "openrouter"),
+            ("Groq", "groq"),
+            ("DeepSeek", "deepseek"),
+            ("KoboldCpp (local)", "koboldcpp"),
+            ("vLLM (local)", "vllm"),
+        ], cfg.llm.provider.lower(),
+            lambda v: self._apply_provider(v))
+        llm_menu.addSeparator()
+        key_label = self._mask_key(cfg.llm.api_key)
+        set_key_act = llm_menu.addAction(f"API Key: {key_label}...")
+        set_key_act.triggered.connect(lambda: self._set_llm_api_key(parent))
+
+        url_label = cfg.llm.base_url or "(default)"
+        set_url_act = llm_menu.addAction(f"Base URL: {url_label}...")
+        set_url_act.triggered.connect(lambda: self._set_base_url(parent))
+
+        prefill_label = cfg.llm.prefill[:30] + "..." if len(cfg.llm.prefill) > 30 else cfg.llm.prefill or "(default)"
+        set_prefill_act = llm_menu.addAction(f"Prefill: {prefill_label}...")
+        set_prefill_act.triggered.connect(lambda: self._set_prefill(parent))
+
+        # ── LLM Model submenu (auto-fetched from API) ─────────────────
+        model_choices = self._get_model_choices()
+        self._radio_submenu(menu, "LLM Model", model_choices, cfg.llm.model,
+            lambda v: self._apply_model(v))
+
+        # ── Vision LLM submenu ────────────────────────────────────────
+        vlm_menu = menu.addMenu("Vision LLM")
+        vlm_cfg = cfg.vision_llm
+        if vlm_cfg:
+            self._add_toggle(vlm_menu, "Enabled", vlm_cfg.enabled,
+                             lambda c: self._set_vlm("enabled", c))
+            vlm_menu.addSeparator()
+            self._radio_submenu_into(vlm_menu, [
+                ("Gemini", "gemini"),
+                ("OpenAI", "openai"),
+                ("OpenRouter", "openrouter"),
+            ], vlm_cfg.provider, lambda v: self._apply_vlm_provider(v))
+            vlm_menu.addSeparator()
+            vlm_model_act = vlm_menu.addAction(f"Model: {vlm_cfg.model}...")
+            vlm_model_act.triggered.connect(lambda: self._set_vlm_model(parent))
+            nkeys = len(vlm_cfg.api_keys)
+            vlm_keys_act = vlm_menu.addAction(f"API Keys ({nkeys})...")
+            vlm_keys_act.triggered.connect(lambda: self._set_vlm_api_keys(parent))
+            vlm_url_label = vlm_cfg.base_url or "(auto)"
+            vlm_url_act = vlm_menu.addAction(f"Base URL: {vlm_url_label}...")
+            vlm_url_act.triggered.connect(lambda: self._set_vlm_base_url(parent))
+            vlm_max_act = vlm_menu.addAction(f"Max Reqs/Key/Day: {vlm_cfg.max_requests_per_key_per_day}...")
+            vlm_max_act.triggered.connect(lambda: self._set_vlm_max_requests(parent))
+        else:
+            vlm_menu.addAction("(not configured)").setEnabled(False)
+
+        # ── Character picker ──────────────────────────────────────────
+        from llm.prompt import get_character_name
+        char_act = menu.addAction(f"Character: {get_character_name()}...")
+        char_act.triggered.connect(lambda: self._show_character_picker(parent))
+        edit_personality_act = menu.addAction("Edit Personality...")
+        edit_personality_act.triggered.connect(self._edit_personality)
+        open_presets_act = menu.addAction("Open Presets Folder")
+        open_presets_act.triggered.connect(self._open_presets_folder)
+
+        # ── Voice model (speaker verification) ──────────────────────
+        voice_menu = menu.addMenu("Voice Model")
+        from stt.speaker_id import SpeakerVerifier
+        _verifier = getattr(self._get_transcriber(), "speaker_verifier", None)
+        _enrolled = _verifier.enrolled if _verifier else False
+        train_act = voice_menu.addAction("Train Voice Model..." if not _enrolled else "Re-train Voice Model...")
+        train_act.triggered.connect(lambda: self._train_voice_model(parent))
+        if _enrolled:
+            clear_act = voice_menu.addAction("Clear Voice Model")
+            clear_act.triggered.connect(self._clear_voice_model)
+            status_act = voice_menu.addAction("Status: Enrolled ✓")
+            status_act.setEnabled(False)
+        else:
+            status_act = voice_menu.addAction("Status: Not enrolled")
+            status_act.setEnabled(False)
+
+        # ── Relationship submenu ─────────────────────────────────────
+        rel_menu = menu.addMenu("Relationship")
+        rel_group = QActionGroup(rel_menu)
+        current_rel = cfg.llm.relationship
+
+        for label, slug in [
+            ("Lover / Partner", "lover"),
+            ("Best Friend", "best_friend"),
+            ("Roommate", "roommate"),
+            ("Caretaker", "caretaker"),
+        ]:
+            act = QAction(label, rel_menu)
+            act.setCheckable(True)
+            act.setChecked(current_rel == slug)
+            act.triggered.connect(lambda checked, s=slug: self._apply_relationship(s))
+            rel_group.addAction(act)
+            rel_menu.addAction(act)
+
+        rel_menu.addSeparator()
+        custom_rel_act = rel_menu.addAction("Custom...")
+        custom_rel_act.triggered.connect(lambda: self._set_custom_relationship(parent))
+
+        # ── TTS / ElevenLabs submenu ─────────────────────────────────
+        tts_menu = menu.addMenu("TTS")
+        self._radio_submenu_into(tts_menu, [
+            ("ElevenLabs", "elevenlabs"),
+            ("Local (ponyvoicetool)", "openai_compatible"),
+        ], cfg.tts.provider,
+            lambda v: self._set("tts", "provider", v))
+        tts_menu.addSeparator()
+        el_key_label = self._mask_key(cfg.elevenlabs.api_key)
+        el_key_act = tts_menu.addAction(f"ElevenLabs API Key: {el_key_label}...")
+        el_key_act.triggered.connect(lambda: self._set_elevenlabs_key(parent))
+        el_vid_label = cfg.elevenlabs.voice_id[:8] + "..." if len(cfg.elevenlabs.voice_id) > 8 else cfg.elevenlabs.voice_id or "(not set)"
+        el_vid_act = tts_menu.addAction(f"ElevenLabs Voice ID: {el_vid_label}...")
+        el_vid_act.triggered.connect(lambda: self._set_elevenlabs_voice_id(parent))
+
+        # ── Audio Devices submenu ─────────────────────────────────────
+        audio_menu = menu.addMenu("Audio Devices (restart needed)")
+        self._build_audio_submenu(audio_menu)
+
+        # ── Multi-pony ─────────────────────────────────────────────────
+        if self.pony_manager is not None:
+            menu.addSeparator()
+            self._build_multi_pony_menu(menu, parent)
+
+        # ── Presentation Mode (secret) ────────────────────────────────
+        if cfg.presentation_mode:
+            menu.addSeparator()
+            self._build_presentation_menu(menu, parent)
+
+        menu.addSeparator()
+
+        # ── Utilities ─────────────────────────────────────────────────
+        menu.addAction("Open Ack Sounds Folder").triggered.connect(
+            lambda: self._open_ack_folder())
+        menu.addAction("Open Config File").triggered.connect(
+            lambda: self._open_file(self.config_path))
+        menu.addAction("Open Log File").triggered.connect(
+            lambda: self._open_file(cfg.logging.log_file))
+        menu.addAction("Reset Memory...").triggered.connect(
+            lambda: self._reset_memory(parent))
+
+        menu.addSeparator()
+
+        update_act = menu.addAction("Check for Updates...")
+        update_act.triggered.connect(lambda: self._check_for_updates(parent))
+
+        restart_act = menu.addAction("Restart")
+        restart_act.triggered.connect(self._restart)
+
+        quit_act = menu.addAction("Quit")
+        quit_act.triggered.connect(self.on_quit if self.on_quit else QApplication.quit)
+
+        return menu
+
+    # ── Widget helpers ────────────────────────────────────────────────────
+
+    def _toggle(self, text: str, checked: bool, callback) -> QAction:
+        act = QAction(text)
+        act.setCheckable(True)
+        act.setChecked(checked)
+        act.triggered.connect(callback)
+        return act
+
+    @staticmethod
+    def _add_toggle(menu: QMenu, text: str, checked: bool, callback) -> QAction:
+        """Create a checkable action parented to the menu so it won't be GC'd."""
+        act = menu.addAction(text)
+        act.setCheckable(True)
+        act.setChecked(checked)
+        act.triggered.connect(callback)
+        return act
+
+    def _radio_submenu(self, parent_menu: QMenu, title: str,
+                       options: list, current, callback) -> None:
+        sub = parent_menu.addMenu(title)
+        self._radio_submenu_into(sub, options, current, callback)
+
+    def _radio_submenu_into(self, sub: QMenu, options: list, current, callback) -> None:
+        group = QActionGroup(sub)
+        for label, value in options:
+            act = QAction(label, sub)
+            act.setCheckable(True)
+            # Match check: float tolerance or string equality
+            if isinstance(value, float) and isinstance(current, (int, float)):
+                act.setChecked(abs(float(current) - value) < 0.01)
+            else:
+                act.setChecked(str(current) == str(value))
+            act.triggered.connect(lambda checked, v=value: callback(v))
+            group.addAction(act)
+            sub.addAction(act)
+
+    # ── Config setters ────────────────────────────────────────────────────
+
+    def _set(self, section: str, key: str, value) -> None:
+        """Update live config + persist to YAML."""
+        obj = getattr(self.config, section)
+        setattr(obj, key, value)
+        _save_yaml_value(f"{section}.{key}", value, self.config_path)
+        logger.info("Config: %s.%s = %s", section, key, value)
+
+    def _set_activity_level(self, multiplier: float) -> None:
+        """Scale ALL timing settings from a single activity multiplier."""
+        cfg = self.config.agent
+        cfg.activity_multiplier = multiplier
+        # Scale all timing from "Normal" baselines
+        cfg.base_check_interval_s = max(30.0, 300.0 * multiplier)
+        cfg.self_initiate_interval_s = max(60.0, 300.0 * multiplier)
+        cfg.spontaneous_speech_min_s = max(30.0, 120.0 * multiplier)
+        cfg.spontaneous_speech_max_s = max(60.0, 300.0 * multiplier)
+
+        # Persist all derived values
+        for key in ("activity_multiplier", "base_check_interval_s",
+                     "self_initiate_interval_s", "spontaneous_speech_min_s",
+                     "spontaneous_speech_max_s"):
+            _save_yaml_value(f"agent.{key}", getattr(cfg, key), self.config_path)
+
+        # Scale multi-pony chat interval
+        if self.pony_manager is not None:
+            self.pony_manager.chat_interval_s = max(120.0, 600.0 * multiplier)
+
+        logger.info("Activity level set: multiplier=%.2f, check=%.0fs",
+                     multiplier, cfg.base_check_interval_s)
+
+    def _iter_speech_bubbles(self):
+        """Yield all live SpeechBubble widgets across primary + secondary ponies."""
+        seen = set()
+        if self.pony_instance is not None:
+            sb = getattr(self.pony_instance, "speech_bubble", None)
+            if sb is not None:
+                seen.add(id(sb))
+                yield sb
+        mgr = self.pony_manager
+        if mgr is not None:
+            # PonyManager exposes `.ponies`, NOT `._ponies` — the underscore
+            # version silently yields nothing and the font toggle looks dead.
+            for p in getattr(mgr, "ponies", []) or []:
+                sb = getattr(p, "speech_bubble", None)
+                if sb is not None and id(sb) not in seen:
+                    seen.add(id(sb))
+                    yield sb
+
+    def _set_font_style(self, style: str) -> None:
+        """Toggle pixel (m5x7) vs default font on all live speech bubbles.
+        Pops an immediate test bubble so the user can SEE the change."""
+        self._set("desktop_pet", "font_style", style)
+        applied = 0
+        for sb in self._iter_speech_bubbles():
+            try:
+                sb.set_font_style(style)
+                applied += 1
+            except Exception as exc:
+                logger.debug("Font style apply failed: %s", exc)
+        logger.info("Font style set to %s — applied to %d bubble(s)", style, applied)
+
+        # Fire a test bubble so the user immediately sees the new font.
+        # Without this, toggling the menu option feels dead because the
+        # bubble only appears on the next LLM response.
+        try:
+            pony = self.pony_instance
+            if pony is not None and getattr(pony, "speech_bubble", None):
+                sb = pony.speech_bubble
+                pw = getattr(pony, "pet_window", None)
+                if pw is not None:
+                    ax = pw.x() + pw.width() // 2
+                    ay = pw.y()
+                    msg = ("pixel font on!" if style == "m5x7"
+                           else "back to normal font")
+                    sb.show_text(msg, ax, ay, sprite_h=pw.height())
+        except Exception as exc:
+            logger.debug("Font test bubble failed: %s", exc)
+
+    def _set_typewriter_sound(self, enabled: bool) -> None:
+        """Toggle typewriter click on all live speech bubbles."""
+        self._set("desktop_pet", "typewriter_sound", enabled)
+        for sb in self._iter_speech_bubbles():
+            try:
+                sb.set_typewriter_sound(enabled)
+            except Exception as exc:
+                logger.debug("Typewriter toggle apply failed: %s", exc)
+
+    def _set_read_only(self, enabled: bool, parent: QWidget) -> None:
+        """Toggle read-only / safe mode. Flips safety.read_only_mode + disables
+        desktop_control in one meta-action. LLM/TTS provider switches require
+        a restart — we surface that to the user with a MessageBox."""
+        self._set("safety", "read_only_mode", bool(enabled))
+        # Also disable desktop_control so the menu state matches the guard
+        if enabled:
+            self._set("desktop_control", "enabled", False)
+        logger.info("Read-Only mode: %s", "ON" if enabled else "OFF")
+
+        # Let the LLM know live — system prompt will start including the
+        # read-only notice on the next chat turn.
+        try:
+            from llm.prompt import set_safety_config
+            set_safety_config(self.config.safety)
+        except Exception:
+            pass
+
+        needs_restart = False
+        if enabled:
+            prov = (self.config.llm.provider or "").lower()
+            if prov in {"anthropic", "openai", "openrouter", "deepseek", "groq",
+                        "gemini", "google", "mistral", "cohere", "xai", "grok", "zai"}:
+                needs_restart = True
+            if (self.config.tts.provider or "").lower() != "openai_compatible":
+                needs_restart = True
+
+        if needs_restart:
+            QMessageBox.information(
+                parent, "Read-Only Mode",
+                "Read-Only mode is ON.\n\n"
+                "Runtime behaviors (desktop commands, AFK mischief, force-\n"
+                "escalation, standing-rule closing) are now blocked.\n\n"
+                "Your LLM/TTS providers are cloud-based. Restart the app to\n"
+                "switch to local-only LLM/TTS. Until restart, the app keeps\n"
+                "using the current providers for conversation.",
+            )
+
+    def _set_auto_update(self, enabled: bool) -> None:
+        """Toggle auto-update and sync the marker file retardsetup.bat reads."""
+        # Persist to config.yaml at top level (not nested under a section)
+        self.config.auto_update = bool(enabled)
+        try:
+            _save_yaml_value("auto_update", bool(enabled), self.config_path)
+        except Exception as exc:
+            logger.debug("auto_update persist failed: %s", exc)
+
+        # Create / remove the marker file
+        try:
+            from pathlib import Path as _Path
+            marker = _Path(".autoupdate_enabled")
+            if enabled:
+                if not marker.exists():
+                    marker.write_text("1", encoding="utf-8")
+            else:
+                if marker.exists():
+                    marker.unlink()
+        except Exception as exc:
+            logger.debug("auto_update marker sync failed: %s", exc)
+        logger.info("Auto-Update: %s", "ON" if enabled else "OFF")
+
+    def _set_screen_vision(self, provider: str) -> None:
+        """Switch between API and Moondream screen vision.  Requires restart for Moondream."""
+        self._set("vision", "screen_vision", provider)
+        if provider == "moondream":
+            QMessageBox.information(
+                None, "Screen Vision",
+                "Moondream (local) selected.\n\n"
+                "Requires ~2 GB RAM and the 'transformers' package.\n"
+                "Restart the app to load the model.",
+            )
+
+    def _set_conversation_only(self, enabled: bool) -> None:
+        """Toggle conversation-only mode: disable all computer control features."""
+        if enabled:
+            # Disable everything except pure conversation
+            self._set("agent", "enabled", False)
+            self._set("agent", "self_initiate", False)
+            self._set("desktop_control", "enabled", False)
+            self._set("vision", "screen_capture", False)
+            self._set("vision", "enabled", False)
+        else:
+            # Re-enable all features
+            self._set("agent", "enabled", True)
+            self._set("agent", "self_initiate", True)
+            self._set("desktop_control", "enabled", True)
+            self._set("vision", "screen_capture", True)
+            self._set("vision", "enabled", True)
+        logger.info("Conversation Only mode: %s", "ON" if enabled else "OFF")
+
+    def _get_model_choices(self) -> list[tuple[str, str]]:
+        """Fetch available models from the LLM provider API. Cached after first call."""
+        if hasattr(self, "_model_choices_cache") and self._model_choices_cache is not None:
+            return self._model_choices_cache
+
+        choices: list[tuple[str, str]] = []
+
+        # Non-chat model prefixes to filter out (embeddings, TTS, image, etc.)
+        _skip = ("whisper", "tts-", "dall-e", "text-embedding", "text-moderation",
+                 "babbage", "davinci", "canary")
+
+        try:
+            client = getattr(self.llm, "_client", None)
+            if client and hasattr(client, "models"):
+                result = client.models.list()
+                models_iter = result.data if hasattr(result, "data") else list(result)
+                for m in models_iter:
+                    mid = m.id if hasattr(m, "id") else str(m)
+                    if any(mid.lower().startswith(p) for p in _skip):
+                        continue
+                    choices.append((mid, mid))
+                choices.sort(key=lambda x: x[0].lower())
+        except Exception as exc:
+            logger.debug("Failed to fetch models from API: %s", exc)
+
+        # Ensure current model is always in the list
+        current = self.config.llm.model
+        if not any(v == current for _, v in choices):
+            choices.insert(0, (current, current))
+
+        # Fallback if nothing was fetched
+        if len(choices) <= 1:
+            provider = self.config.llm.provider.lower()
+            if provider == "anthropic":
+                choices = [
+                    ("claude-haiku-4-5-20251001", "claude-haiku-4-5-20251001"),
+                    ("claude-sonnet-4-6", "claude-sonnet-4-6"),
+                    ("claude-opus-4-6", "claude-opus-4-6"),
+                ]
+            else:
+                choices = [
+                    ("gpt-4o-mini", "gpt-4o-mini"),
+                    ("gpt-4o", "gpt-4o"),
+                    (current, current),
+                ]
+                # Deduplicate
+                seen = set()
+                choices = [(l, v) for l, v in choices if v not in seen and not seen.add(v)]
+
+        self._model_choices_cache = choices
+        return choices
+
+    @staticmethod
+    def _mask_key(key: str) -> str:
+        """Show first 4 and last 4 chars of a key, mask the rest."""
+        if not key:
+            return "(not set)"
+        if len(key) <= 10:
+            return "****"
+        return key[:4] + "..." + key[-4:]
+
+    def _set_llm_api_key(self, parent: QWidget) -> None:
+        """Set the LLM API key from the menu."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.llm.api_key or ""
+        key, ok = QInputDialog.getText(
+            parent, "LLM API Key",
+            "Enter your LLM API key.\n"
+            "This will be saved to config.yaml and take effect immediately.",
+            QLineEdit.Normal, current,
+        )
+        if not ok:
+            return
+        key = key.strip()
+        self.config.llm.api_key = key
+        _save_yaml_value("llm.api_key", key, self.config_path)
+        # Hot-swap provider so new key takes effect
+        if self.on_provider_change:
+            self.on_provider_change(self.config.llm.provider)
+        logger.info("LLM API key updated.")
+
+    def _set_elevenlabs_key(self, parent: QWidget) -> None:
+        """Set the ElevenLabs API key from the menu."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.elevenlabs.api_key or ""
+        key, ok = QInputDialog.getText(
+            parent, "ElevenLabs API Key",
+            "Enter your ElevenLabs API key.\n"
+            "Takes effect on next TTS call (no restart needed).",
+            QLineEdit.Normal, current,
+        )
+        if not ok:
+            return
+        key = key.strip()
+        self.config.elevenlabs.api_key = key
+        _save_yaml_value("elevenlabs.api_key", key, self.config_path)
+        if self.tts and hasattr(self.tts, "api_key"):
+            self.tts.api_key = key
+        logger.info("ElevenLabs API key updated.")
+
+    def _set_elevenlabs_voice_id(self, parent: QWidget) -> None:
+        """Set the ElevenLabs voice ID from the menu."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.elevenlabs.voice_id or ""
+        vid, ok = QInputDialog.getText(
+            parent, "ElevenLabs Voice ID",
+            "Enter your ElevenLabs voice ID.",
+            QLineEdit.Normal, current,
+        )
+        if not ok:
+            return
+        vid = vid.strip()
+        self.config.elevenlabs.voice_id = vid
+        _save_yaml_value("elevenlabs.voice_id", vid, self.config_path)
+        if self.tts and hasattr(self.tts, "voice_id"):
+            self.tts.voice_id = vid
+        logger.info("ElevenLabs voice ID updated to: %s", vid)
+
+    def _set_base_url(self, parent: QWidget) -> None:
+        """Let the user type a custom base URL for the LLM provider."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.llm.base_url or ""
+        url, ok = QInputDialog.getText(
+            parent, "LLM Base URL",
+            "Enter the base URL for your LLM provider.\n"
+            "Leave blank to use the default for the selected provider.",
+            QLineEdit.Normal, current,
+        )
+        if not ok:
+            return
+        url = url.strip()
+        if url:
+            self.config.llm.base_url = url
+            _save_yaml_value("llm.base_url", url, self.config_path)
+        else:
+            self.config.llm.base_url = None
+            _save_yaml_value("llm.base_url", None, self.config_path)
+        # Hot-swap the provider with the new URL
+        if self.on_provider_change:
+            self.on_provider_change(self.config.llm.provider)
+        logger.info("LLM base_url changed to: %s", self.config.llm.base_url)
+
+    def _apply_provider(self, provider: str) -> None:
+        """Hot-swap the LLM provider (creates a new client)."""
+        self.config.llm.provider = provider
+        _save_yaml_value("llm.provider", provider, self.config_path)
+
+        # Auto-set base_url for known providers, clear for cloud providers
+        from llm.factory import _KNOWN_BASE_URLS
+        if provider in _KNOWN_BASE_URLS:
+            self.config.llm.base_url = _KNOWN_BASE_URLS[provider]
+            _save_yaml_value("llm.base_url", self.config.llm.base_url, self.config_path)
+        elif provider in ("openai", "anthropic"):
+            self.config.llm.base_url = None
+            _save_yaml_value("llm.base_url", None, self.config_path)
+
+        # Clear cached model list so next menu open fetches from the new provider
+        self._model_choices_cache = None
+
+        if self.on_provider_change:
+            self.on_provider_change(provider)
+        logger.info("LLM provider changed to: %s", provider)
+
+    def _apply_model(self, model_id: str) -> None:
+        """Hot-swap the LLM model (no restart needed)."""
+        if self.llm and hasattr(self.llm, "model"):
+            self.llm.model = model_id
+        self.config.llm.model = model_id
+        _save_yaml_value("llm.model", model_id, self.config_path)
+        logger.info("LLM model changed to: %s", model_id)
+
+    # ── Vision LLM setters ─────────────────────────────────────────────
+
+    def _set_vlm(self, key: str, value) -> None:
+        """Update a vision_llm config field and persist."""
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        setattr(vlm_cfg, key, value)
+        _save_yaml_value(f"vision_llm.{key}", value, self.config_path)
+        logger.info("Vision LLM: %s = %s", key, value)
+        if self.on_vision_llm_change:
+            self.on_vision_llm_change()
+
+    def _apply_vlm_provider(self, provider: str) -> None:
+        """Switch vision LLM provider."""
+        self._set_vlm("provider", provider)
+
+    def _set_vlm_model(self, parent: QWidget) -> None:
+        from PyQt5.QtWidgets import QInputDialog
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        model, ok = QInputDialog.getText(
+            parent, "Vision LLM Model",
+            "Enter the model name for Vision LLM:",
+            QLineEdit.Normal, vlm_cfg.model,
+        )
+        if ok and model.strip():
+            self._set_vlm("model", model.strip())
+
+    def _set_vlm_api_keys(self, parent: QWidget) -> None:
+        """Dialog to manage vision LLM API keys."""
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        from PyQt5.QtWidgets import QInputDialog
+        current = "\n".join(vlm_cfg.api_keys)
+        text, ok = QInputDialog.getMultiLineText(
+            parent, "Vision LLM API Keys",
+            "Enter API keys (one per line).\n"
+            "Keys rotate automatically to spread rate limits.",
+            current,
+        )
+        if not ok:
+            return
+        keys = [k.strip() for k in text.strip().splitlines() if k.strip()]
+        vlm_cfg.api_keys = keys
+        _save_yaml_list("vision_llm.api_keys", keys, self.config_path)
+        logger.info("Vision LLM: updated %d API keys", len(keys))
+        if self.on_vision_llm_change:
+            self.on_vision_llm_change()
+
+    def _set_vlm_base_url(self, parent: QWidget) -> None:
+        from PyQt5.QtWidgets import QInputDialog
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        url, ok = QInputDialog.getText(
+            parent, "Vision LLM Base URL",
+            "Enter base URL (leave blank for auto-detect):",
+            QLineEdit.Normal, vlm_cfg.base_url or "",
+        )
+        if not ok:
+            return
+        url = url.strip() or None
+        vlm_cfg.base_url = url
+        _save_yaml_value("vision_llm.base_url", url, self.config_path)
+        logger.info("Vision LLM base_url: %s", url)
+        if self.on_vision_llm_change:
+            self.on_vision_llm_change()
+
+    def _set_vlm_max_requests(self, parent: QWidget) -> None:
+        from PyQt5.QtWidgets import QInputDialog
+        vlm_cfg = self.config.vision_llm
+        if not vlm_cfg:
+            return
+        val, ok = QInputDialog.getInt(
+            parent, "Vision LLM Max Requests",
+            "Max requests per API key per day:",
+            vlm_cfg.max_requests_per_key_per_day, 1, 10000,
+        )
+        if ok:
+            self._set_vlm("max_requests_per_key_per_day", val)
+
+    def _apply_scale(self, scale: float) -> None:
+        """Change sprite scale (live reload)."""
+        self.config.desktop_pet.scale = scale
+        _save_yaml_value("desktop_pet.scale", scale, self.config_path)
+        if self.on_scale_change:
+            self.on_scale_change(scale)
+        logger.info("Scale changed to: %.1f", scale)
+
+    def _show_character_picker(self, parent: QWidget) -> None:
+        """Open the character picker dialog."""
+        from llm.prompt import get_active_preset
+        dlg = _CharacterPickerDialog(get_active_preset(), parent)
+        if dlg.exec_() == QDialog.Accepted:
+            slug = dlg.get_selected_slug()
+            if slug and slug != get_active_preset():
+                self._apply_character(slug)
+
+    def _apply_character(self, preset_slug: str) -> None:
+        """Hot-swap the active character."""
+        if self.on_character_change:
+            self.on_character_change(preset_slug)
+
+    def _apply_relationship(self, slug: str) -> None:
+        """Switch relationship mode."""
+        self.config.llm.relationship = slug
+        _save_yaml_value("llm.relationship", slug, self.config_path)
+        from llm.prompt import set_relationship
+        set_relationship(slug, self.config.llm.relationship_custom)
+        if self.llm:
+            self.llm.reset_history()
+        logger.info("Relationship changed to: %s", slug)
+
+    def _set_custom_relationship(self, parent: QWidget) -> None:
+        """Open a text dialog for custom relationship prompt."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.llm.relationship_custom or ""
+        text, ok = QInputDialog.getMultiLineText(
+            parent, "Custom Relationship",
+            "Describe how the character should relate to you.\n"
+            "This replaces the default relationship prompt.\n\n"
+            "Examples:\n"
+            "- You are the user's study buddy. Help them focus.\n"
+            "- You are the user's rival. Everything is a competition.",
+            current,
+        )
+        if not ok:
+            return
+        text = text.strip()
+        self.config.llm.relationship = "custom"
+        self.config.llm.relationship_custom = text
+        _save_yaml_value("llm.relationship", "custom", self.config_path)
+        _save_yaml_value("llm.relationship_custom", text, self.config_path)
+        from llm.prompt import set_relationship
+        set_relationship("custom", text)
+        if self.llm:
+            self.llm.reset_history()
+        logger.info("Custom relationship set (%d chars)", len(text))
+
+    def _set_prefill(self, parent: QWidget) -> None:
+        """Set the custom LLM prefill text."""
+        from PyQt5.QtWidgets import QInputDialog
+        current = self.config.llm.prefill or ""
+        text, ok = QInputDialog.getText(
+            parent, "LLM Prefill",
+            "Custom prefill injected as a first assistant turn.\n"
+            "Use {name} for the character's name. Leave blank for default.\n\n"
+            "Default: (I am {name}. I stay in character at all times.)",
+            QLineEdit.Normal, current,
+        )
+        if not ok:
+            return
+        text = text.strip()
+        self.config.llm.prefill = text
+        _save_yaml_value("llm.prefill", text, self.config_path)
+        # Hot-swap: re-create provider so it picks up the new prefill
+        if self.on_provider_change:
+            self.on_provider_change(self.config.llm.provider)
+        logger.info("LLM prefill updated to: %s", text[:50] if text else "(default)")
+
+    # ── Secondary pony menu ──────────────────────────────────────────────
+
+    def _build_secondary_menu(self, menu: QMenu, parent: QWidget) -> QMenu:
+        """Build a lightweight menu for secondary pony windows."""
+        inst = self.pony_instance
+        name = inst.display_name if inst else "Pony"
+
+        # Character name label (informational)
+        name_act = menu.addAction(f"Character: {name}")
+        name_act.setEnabled(False)
+
+        menu.addSeparator()
+
+        # Multi-pony controls (Add / Remove)
+        if self.pony_manager is not None:
+            self._build_multi_pony_menu(menu, parent)
+            menu.addSeparator()
+
+        # Scale submenu (shared)
+        cfg = self.config
+        self._radio_submenu(menu, "Scale", [
+            ("Tiny (1x)", 1.0),
+            ("Normal (2x)", 2.0),
+            ("Big (3x)", 3.0),
+            ("Huge (4x)", 4.0),
+        ], cfg.desktop_pet.scale,
+            lambda v: self._apply_scale(v))
+
+        menu.addSeparator()
+
+        quit_act = menu.addAction("Quit")
+        quit_act.triggered.connect(self.on_quit if self.on_quit else QApplication.quit)
+
+        return menu
+
+    # ── Multi-pony menu builders ─────────────────────────────────────────
+
+    def _build_multi_pony_menu(self, menu: QMenu, parent: QWidget) -> None:
+        """Add the 'Add Pony' submenu and optional 'Remove This Pony' action."""
+        mgr = self.pony_manager
+        if mgr is None:
+            return
+
+        # ── Add Pony submenu ──
+        add_menu = menu.addMenu("Add Pony")
+
+        # Quick-add: the 6 mane characters (minus any already active)
+        mane_six = [
+            ("Twilight Sparkle", "twilight_sparkle"),
+            ("Rainbow Dash", "rainbow_dash"),
+            ("Pinkie Pie", "pinkie_pie"),
+            ("Rarity", "rarity"),
+            ("Fluttershy", "fluttershy"),
+            ("Applejack", "applejack"),
+        ]
+        for display, slug in mane_six:
+            act = add_menu.addAction(display)
+            act.triggered.connect(lambda checked, s=slug: self._add_pony(s))
+            if len(mgr.ponies) >= mgr.max_ponies:
+                act.setEnabled(False)
+
+        add_menu.addSeparator()
+        browse_act = add_menu.addAction("Browse All...")
+        browse_act.triggered.connect(lambda: self._browse_add_pony(parent))
+        if len(mgr.ponies) >= mgr.max_ponies:
+            browse_act.setEnabled(False)
+
+        # ── Remove This Pony (only for secondaries) ──
+        inst = self.pony_instance
+        if inst and not inst.is_primary:
+            remove_act = menu.addAction(f"Remove {inst.display_name}")
+            remove_act.triggered.connect(lambda: self._remove_pony(inst))
+
+        # ── Show pony count ──
+        count_act = menu.addAction(f"Ponies: {len(mgr.ponies)}/{mgr.max_ponies}")
+        count_act.setEnabled(False)
+
+    def _add_pony(self, slug: str) -> None:
+        """Add a secondary pony via PonyManager."""
+        mgr = self.pony_manager
+        if mgr is None:
+            return
+        instance = mgr.add_pony(slug)
+        if instance is None:
+            logger.warning("Could not add pony: %s (at capacity?)", slug)
+
+    def _browse_add_pony(self, parent: QWidget) -> None:
+        """Open the full character picker to add any character."""
+        dlg = _CharacterPickerDialog("", parent)
+        dlg.setWindowTitle("Add Pony")
+        if dlg.exec_() == QDialog.Accepted:
+            slug = dlg.get_selected_slug()
+            if slug:
+                self._add_pony(slug)
+
+    def _remove_pony(self, instance) -> None:
+        """Remove a secondary pony via PonyManager."""
+        mgr = self.pony_manager
+        if mgr is None:
+            return
+        mgr.remove_pony(instance)
+
+    def _open_ack_folder(self) -> None:
+        """Open the current character's acknowledgement sounds folder."""
+        if self.ack_player:
+            folder = self.ack_player.get_assets_dir()
+            folder.mkdir(parents=True, exist_ok=True)
+            self._open_file(str(folder))
+
+    # ── Presentation mode ────────────────────────────────────────────────
+
+    def _build_presentation_menu(self, menu: QMenu, parent: QWidget) -> None:
+        """Build the secret presentation/demo menu for showing off features."""
+        pres_menu = menu.addMenu("Presentation")
+
+        # Toggle AFK — force the pony into thinking user is away
+        afk_label = "AFK Mode: ON" if (self.agent_loop and self.agent_loop.is_force_afk) else "AFK Mode: OFF"
+        afk_act = pres_menu.addAction(afk_label)
+        afk_act.triggered.connect(self._toggle_force_afk)
+        afk_act.setEnabled(self.agent_loop is not None)
+
+        # Live Demo — 1min AFK, mischief every 30s, active computer usage
+        demo_label = "Live Demo: ON" if (self.agent_loop and self.agent_loop.is_live_demo) else "Live Demo: OFF"
+        demo_act = pres_menu.addAction(demo_label)
+        demo_act.triggered.connect(self._toggle_live_demo)
+        demo_act.setEnabled(self.agent_loop is not None)
+
+        pres_menu.addSeparator()
+
+        # Trigger Group Chat — immediate inter-pony banter
+        chat_act = pres_menu.addAction("Trigger Group Chat")
+        chat_act.triggered.connect(self._force_group_chat)
+        chat_act.setEnabled(self.pony_manager is not None and len(self.pony_manager.ponies) >= 2)
+
+        # Spawn Mane Six — fill the desktop with ponies
+        spawn_act = pres_menu.addAction("Spawn Mane Six")
+        spawn_act.triggered.connect(self._spawn_mane_six)
+        spawn_act.setEnabled(self.pony_manager is not None)
+
+        pres_menu.addSeparator()
+
+        # CHAOS MODE — the big red button
+        chaos_act = pres_menu.addAction("DESTROY PC")
+        chaos_act.triggered.connect(self._chaos_mode)
+        chaos_act.setEnabled(self.pony_manager is not None)
+
+    def _toggle_force_afk(self) -> None:
+        """Toggle forced AFK state for presentation mode."""
+        if not self.agent_loop:
+            return
+        new_state = self.agent_loop.toggle_force_afk()
+        logger.info("Presentation: AFK toggled to %s", new_state)
+
+    def _toggle_live_demo(self) -> None:
+        """Toggle live demo mode — 1min AFK, 30s mischief, active computer use."""
+        if not self.agent_loop:
+            return
+        new_state = self.agent_loop.toggle_live_demo()
+        logger.info("Presentation: Live Demo toggled to %s", new_state)
+
+    def _force_group_chat(self) -> None:
+        """Immediately trigger a group conversation."""
+        if not self.pony_manager:
+            return
+        self.pony_manager.force_spontaneous_chat()
+
+    def _spawn_mane_six(self) -> None:
+        """Spawn all mane six ponies that aren't already on screen."""
+        if not self.pony_manager:
+            return
+        mane_six = ["twilight_sparkle", "rainbow_dash", "pinkie_pie",
+                     "rarity", "fluttershy", "applejack"]
+        existing = {p.slug for p in self.pony_manager.ponies}
+        for slug in mane_six:
+            if slug not in existing and len(self.pony_manager.ponies) < self.pony_manager.max_ponies:
+                self.pony_manager.add_pony(slug)
+
+    def _chaos_mode(self) -> None:
+        """DESTROY PC — spawn ponies, open chaotic tabs, start themed group convo."""
+        if not self.pony_manager:
+            return
+        # Spawn ponies on main thread (Qt widgets must be created here)
+        self._spawn_mane_six()
+        # Open chaotic tabs + group convo in background (safe for threads)
+        import threading
+        def _run_chaos():
+            import webbrowser
+            chaos_urls = [
+                "https://www.youtube.com/results?search_query=fire+explosion+compilation",
+                "https://www.youtube.com/results?search_query=bonzibuddy+virus+meme",
+                "https://www.youtube.com/results?search_query=nuclear+explosion+4k",
+                "https://www.youtube.com/results?search_query=windows+xp+destruction",
+                "https://www.youtube.com/results?search_query=dank+memes+compilation",
+                "https://www.youtube.com/results?search_query=mlp+chaos+discord",
+                "https://en.wikipedia.org/wiki/BonziBuddy",
+                "https://www.reddit.com/r/softwaregore",
+            ]
+            for url in chaos_urls:
+                try:
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+                import time
+                time.sleep(0.3)
+            import time
+            time.sleep(1.0)
+            self.pony_manager.force_spontaneous_chat(
+                topic="HEY GIRLS! We're destroying this guy's desktop! Open stuff, cause chaos, "
+                      "talk about what you're doing, coordinate the destruction! GO GO GO!"
+            )
+            logger.info("CHAOS MODE — %d tabs opened, %d ponies active",
+                         len(chaos_urls), len(self.pony_manager.ponies))
+        threading.Thread(target=_run_chaos, daemon=True).start()
+
+    # ── Memory reset ─────────────────────────────────────────────────────
+
+    def _reset_memory(self, parent: QWidget) -> None:
+        """Wipe all persistent memory: user profile, events, sessions, and diary."""
+        reply = QMessageBox.warning(
+            parent,
+            "Reset Memory",
+            "This will permanently delete:\n\n"
+            "• User profile (name, interests, facts)\n"
+            "• Events & follow-ups\n"
+            "• Session summaries\n"
+            "• All diary entries\n\n"
+            "This cannot be undone. Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        base = Path(__file__).parent.parent
+        memory_dir = base / "memory"
+        diary_dir = base / "diary"
+        deleted = 0
+
+        for d in (memory_dir, diary_dir):
+            if d.is_dir():
+                for f in d.iterdir():
+                    if f.is_file():
+                        try:
+                            f.unlink()
+                            deleted += 1
+                        except Exception as exc:
+                            logger.warning("Failed to delete %s: %s", f, exc)
+
+        QMessageBox.information(
+            parent,
+            "Memory Reset",
+            f"Deleted {deleted} file(s).\n\n"
+            "The pony will start fresh next conversation.",
+        )
+        logger.info("Memory reset — deleted %d files from memory/ and diary/.", deleted)
+
+    # ── Directive actions ─────────────────────────────────────────────────
+
+    def _clear_directives(self) -> None:
+        if self.agent_loop:
+            self.agent_loop.clear_directives()
+
+    def _show_directives(self, parent: QWidget) -> None:
+        if not self.agent_loop:
+            return
+        dlg = _DirectivesDialog(self.agent_loop, parent)
+        dlg.exec_()
+
+    def _add_directive(self, parent: QWidget) -> None:
+        if not self.agent_loop:
+            return
+        dlg = _AddDirectiveDialog(parent)
+        if dlg.exec_() == QDialog.Accepted:
+            goal, urgency = dlg.get_values()
+            if goal:
+                self.agent_loop.add_directive(goal, urgency, source="user")
+
+    def _show_routines(self, parent: QWidget) -> None:
+        if not self.agent_loop:
+            return
+        dlg = _RoutinesDialog(self.agent_loop, parent)
+        dlg.exec_()
+
+    def _send_ooc(self, parent: QWidget) -> None:
+        """Send an out-of-character meta-instruction to the LLM."""
+        dlg = _OOCDialog(parent)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        text = dlg.get_text()
+        if not text or not self.llm:
+            return
+        ooc_msg = (
+            f"[OOC — out-of-character instruction from the user. This is NOT dialogue. "
+            f"Read this as a meta-note about how to adjust your writing, behavior, or style. "
+            f"Acknowledge briefly in-character, then apply it going forward.]\n\n{text}"
+        )
+        try:
+            response = self.llm.chat(ooc_msg)
+            logger.info("OOC sent: %s → %s", text, response)
+        except Exception as exc:
+            logger.warning("OOC message failed: %s", exc)
+
+    # ── Audio devices ─────────────────────────────────────────────────────
+
+    def _build_audio_submenu(self, menu: QMenu) -> None:
+        devices = _list_audio_devices()
+
+        # Microphone submenu
+        mic_menu = menu.addMenu("Microphone")
+        mic_group = QActionGroup(mic_menu)
+
+        act = QAction("Default", mic_menu)
+        act.setCheckable(True)
+        act.setChecked(self.config.audio.input_device_index == -1)
+        act.triggered.connect(lambda: self._set("audio", "input_device_index", -1))
+        mic_group.addAction(act)
+        mic_menu.addAction(act)
+
+        for idx, name, is_input in devices:
+            if not is_input:
+                continue
+            act = QAction(name, mic_menu)
+            act.setCheckable(True)
+            act.setChecked(self.config.audio.input_device_index == idx)
+            act.triggered.connect(
+                lambda checked, i=idx: self._set("audio", "input_device_index", i))
+            mic_group.addAction(act)
+            mic_menu.addAction(act)
+
+        # Speaker submenu
+        spk_menu = menu.addMenu("Speaker")
+        spk_group = QActionGroup(spk_menu)
+
+        act = QAction("Default", spk_menu)
+        act.setCheckable(True)
+        act.setChecked(self.config.audio.output_device_index == -1)
+        act.triggered.connect(lambda: self._set("audio", "output_device_index", -1))
+        spk_group.addAction(act)
+        spk_menu.addAction(act)
+
+        for idx, name, is_input in devices:
+            if is_input:
+                continue
+            act = QAction(name, spk_menu)
+            act.setCheckable(True)
+            act.setChecked(self.config.audio.output_device_index == idx)
+            act.triggered.connect(
+                lambda checked, i=idx: self._set("audio", "output_device_index", i))
+            spk_group.addAction(act)
+            spk_menu.addAction(act)
+
+    # ── Voice model (speaker verification) ─────────────────────────────
+
+    def _get_transcriber(self):
+        """Return the transcriber, if available."""
+        return self.transcriber
+
+    def _train_voice_model(self, parent: QWidget) -> None:
+        """Record 3 short clips and enroll the user's voice."""
+        import struct
+        import numpy as np
+
+        msg = QMessageBox(parent)
+        msg.setWindowTitle("Voice Model Training")
+        msg.setText(
+            "This will record 3 short clips of your voice (~3 seconds each).\n\n"
+            "Speak naturally — say anything, just keep talking.\n"
+            "After training, the pony will know when YOU are speaking\n"
+            "vs YouTube, TV, or other people."
+        )
+        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        if msg.exec_() != QMessageBox.Ok:
+            return
+
+        transcriber = self._get_transcriber()
+        if not transcriber:
+            QMessageBox.warning(parent, "Voice Model", "Transcriber not available.")
+            return
+
+        sample_rate = 16000
+        clip_seconds = 3
+        num_clips = 3
+        clips = []
+
+        try:
+            import pyaudio
+            from stt.mic_lock import mic_lock
+
+            for clip_idx in range(num_clips):
+                label = f"Recording clip {clip_idx + 1}/{num_clips}... speak now!"
+                progress = QProgressDialog(label, "Cancel", 0, 100, parent)
+                progress.setWindowTitle("Voice Model Training")
+                progress.setMinimumDuration(0)
+                progress.show()
+
+                frame_size = int(sample_rate * 30 / 1000)  # 30ms frames
+                total_frames = int(clip_seconds * sample_rate / frame_size)
+
+                with mic_lock:
+                    pa = pyaudio.PyAudio()
+                    stream_kwargs = dict(
+                        format=pyaudio.paInt16, channels=1, rate=sample_rate,
+                        input=True, frames_per_buffer=frame_size,
+                    )
+                    idx = self.config.audio.input_device_index
+                    if idx >= 0:
+                        stream_kwargs["input_device_index"] = idx
+
+                    stream = pa.open(**stream_kwargs)
+                    frames = []
+
+                    for i in range(total_frames):
+                        if progress.wasCanceled():
+                            stream.stop_stream()
+                            stream.close()
+                            pa.terminate()
+                            return
+                        raw = stream.read(frame_size, exception_on_overflow=False)
+                        frames.append(raw)
+                        progress.setValue(int((i + 1) / total_frames * 100))
+                        QApplication.processEvents()
+
+                    stream.stop_stream()
+                    stream.close()
+                    pa.terminate()
+
+                progress.close()
+
+                # Convert int16 → float32
+                audio_bytes = b"".join(frames)
+                audio_int16 = struct.unpack(f"{len(audio_bytes) // 2}h", audio_bytes)
+                audio_f32 = np.array(audio_int16, dtype=np.float32) / 32768.0
+                clips.append(audio_f32)
+
+                # Brief pause between clips
+                if clip_idx < num_clips - 1:
+                    QMessageBox.information(
+                        parent, "Voice Model Training",
+                        f"Clip {clip_idx + 1} recorded! Click OK for the next one.",
+                    )
+
+            # Enroll
+            from stt.speaker_id import SpeakerVerifier
+            verifier = getattr(transcriber, "speaker_verifier", None)
+            if verifier is None:
+                verifier = SpeakerVerifier()
+                transcriber.speaker_verifier = verifier
+
+            quality = verifier.enroll(clips, sr=sample_rate)
+
+            result = QMessageBox(parent)
+            result.setWindowTitle("Voice Model Training")
+            if quality >= 0.85:
+                result.setText(f"Voice model trained successfully!\nQuality: {quality:.0%}")
+                result.setIcon(QMessageBox.Information)
+            else:
+                result.setText(
+                    f"Voice model saved, but quality is low ({quality:.0%}).\n"
+                    "Try again in a quieter environment for better results."
+                )
+                result.setIcon(QMessageBox.Warning)
+            result.exec_()
+
+        except Exception as exc:
+            logger.warning("Voice model training failed: %s", exc)
+            err = QMessageBox(parent)
+            err.setWindowTitle("Voice Model Error")
+            err.setText(f"Training failed: {exc}")
+            err.setIcon(QMessageBox.Critical)
+            err.exec_()
+
+    def _clear_voice_model(self) -> None:
+        """Delete the enrolled voice profile."""
+        transcriber = self._get_transcriber()
+        verifier = getattr(transcriber, "speaker_verifier", None) if transcriber else None
+        if verifier:
+            verifier.clear()
+            logger.info("Voice model cleared via context menu.")
+        else:
+            # Direct cleanup fallback
+            from stt.speaker_id import SpeakerVerifier
+            SpeakerVerifier().clear()
+
+    # ── Personality editing ─────────────────────────────────────────────
+
+    def _edit_personality(self) -> None:
+        """Open the active character's personality preset in the user's editor."""
+        from llm.prompt import ensure_preset_file
+        path = ensure_preset_file()
+        self._open_file(str(path))
+
+    @staticmethod
+    def _open_presets_folder() -> None:
+        """Open the presets/ directory in Explorer."""
+        presets_dir = Path(__file__).parent.parent / "presets"
+        presets_dir.mkdir(exist_ok=True)
+        try:
+            os.startfile(str(presets_dir))
+        except Exception as exc:
+            logger.warning("Failed to open presets folder: %s", exc)
+
+    # ── File openers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _open_file(path: str) -> None:
+        p = Path(path)
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch()
+        try:
+            os.startfile(str(p))
+        except Exception:
+            try:
+                subprocess.Popen(["notepad", str(p)])
+            except Exception as exc:
+                logger.warning("Failed to open %s: %s", path, exc)
+
+    # ── Restart ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _restart() -> None:
+        """Restart the application."""
+        from core.updater import restart_application
+        restart_application()
+
+    # ── Self-updater ─────────────────────────────────────────────────────
+
+    def _check_for_updates(self, parent: QWidget) -> None:
+        """Check GitHub for updates and offer to install them."""
+        from core.updater import check_for_updates, pull_updates, install_new_requirements, restart_application
+
+        # Check phase
+        has_updates, status_msg, commits = check_for_updates()
+
+        if not has_updates:
+            QMessageBox.information(parent, "bonziPONY Updater", status_msg)
+            return
+
+        # Build changelog
+        changelog = "\n".join(commits) if commits else "(could not fetch changelog)"
+        detail = f"{status_msg}\n\nNew commits:\n{changelog}"
+
+        reply = QMessageBox.question(
+            parent,
+            "bonziPONY Updater",
+            f"{status_msg}\n\nDo you want to update now?\n\n{changelog}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Pull phase
+        ok, pull_msg = pull_updates()
+        if not ok:
+            QMessageBox.warning(parent, "Update Failed", pull_msg)
+            return
+
+        # Install new dependencies
+        dep_ok, dep_msg = install_new_requirements()
+        if not dep_ok:
+            logger.warning("Dependency install issue: %s", dep_msg)
+
+        # Ask to restart
+        reply = QMessageBox.question(
+            parent,
+            "Update Complete",
+            "Update installed successfully!\n\nRestart now to apply changes?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            restart_application()

@@ -1,0 +1,579 @@
+"""
+Query tools for [QUERY:...] tags.
+
+Executes read-only information queries and returns formatted results
+for LLM consumption. The pipeline detects these tags, runs the query,
+and feeds results back so the pony can actually USE the information.
+
+Supported tags:
+  [QUERY:FILE_TREE:path]       — directory tree with numbered entries
+  [QUERY:FILE_TREE:path:depth] — same with custom max depth (default 3)
+  [QUERY:READ_FILE:path]       — read a text file silently
+  [QUERY:KNOWLEDGE:term]       — ctrl+f the data bank (knowledge/ folder)
+  [QUERY:KNOWLEDGE]            — list what's in the data bank
+  [QUERY:KNOWLEDGE_READ:name]  — read a whole note from the data bank
+  [QUERY:CLIPBOARD_HISTORY]    — Windows 10 clipboard history (Win+V items)
+  [QUERY:READ_NOTEPAD]         — text content of open Notepad window(s)
+  [QUERY:PAGE_SOURCE]          — HTML source of the active browser tab
+  [QUERY:PAGE_SOURCE:title]    — HTML source of a tab matching the title
+"""
+
+from __future__ import annotations
+
+import ctypes
+import logging
+import os
+import subprocess
+from pathlib import Path
+from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_MAX_DEPTH = 3
+_MAX_TREE_ITEMS = 150
+
+
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def execute_query(query_tag: str) -> str:
+    """
+    Execute a raw query tag string like '[QUERY:FILE_TREE:C:/Users]'.
+    Returns a human/LLM-readable result string.
+    """
+    inner = query_tag.strip("[]").strip()
+    if inner.upper().startswith("QUERY:"):
+        inner = inner[6:]
+
+    # Split on first colon only — path may contain colons (C:\...)
+    # But FILE_TREE:C:\foo needs special handling
+    first_colon = inner.find(":")
+    if first_colon == -1:
+        qtype = inner.upper()
+        rest = ""
+    else:
+        qtype = inner[:first_colon].upper()
+        rest = inner[first_colon + 1:]
+
+    if qtype == "FILE_TREE":
+        return _file_tree(rest)
+    elif qtype == "READ_FILE":
+        return _read_file(rest)
+    elif qtype == "KNOWLEDGE":
+        from core.knowledge import search as _kb_search
+        return _kb_search(rest)
+    elif qtype == "KNOWLEDGE_READ":
+        from core.knowledge import read_topic as _kb_read
+        return _kb_read(rest)
+    elif qtype == "PAGE_SOURCE":
+        return _page_source(rest)
+    elif qtype == "CLIPBOARD_HISTORY":
+        return _clipboard_history()
+    elif qtype == "READ_NOTEPAD":
+        return _read_notepad()
+    else:
+        return f"[Unknown query type: {qtype}]"
+
+
+# ── Read file ─────────────────────────────────────────────────────────────────
+
+_ALLOWED_EXTENSIONS = {".txt", ".md", ".json", ".yaml", ".yml", ".ini", ".cfg", ".toml", ".csv", ".log"}
+_MAX_FILE_CHARS = 8000
+
+
+def _read_file(path_str: str) -> str:
+    """Read a text file and return its contents. Restricted to safe extensions."""
+    path_str = path_str.strip().strip("\"'")
+    if not path_str:
+        return "No path provided."
+
+    p = Path(path_str)
+
+    if not p.exists():
+        return f"File not found: {path_str}"
+    if p.is_dir():
+        return f"That's a directory, not a file. Use [QUERY:FILE_TREE:{path_str}] to explore it."
+
+    ext = p.suffix.lower()
+    if ext not in _ALLOWED_EXTENSIONS:
+        return (
+            f"Can't read {p.name} — extension '{ext}' not allowed. "
+            f"Readable types: {', '.join(sorted(_ALLOWED_EXTENSIONS))}"
+        )
+
+    try:
+        size = p.stat().st_size
+        if size > 500_000:
+            return f"File too large to read ({_fmt_size(size)}). Max ~500 KB."
+
+        text = p.read_text(encoding="utf-8", errors="replace")
+
+        truncated = False
+        if len(text) > _MAX_FILE_CHARS:
+            text = text[:_MAX_FILE_CHARS]
+            truncated = True
+
+        header = f"=== {p.name} ({_fmt_size(size)}) ==="
+        footer = f"\n... (truncated at {_MAX_FILE_CHARS} chars — file continues)" if truncated else ""
+        return f"{header}\n{text}{footer}"
+
+    except PermissionError:
+        return f"Permission denied reading {p.name}."
+    except Exception as exc:
+        return f"Error reading {p.name}: {exc}"
+
+
+# ── File tree ─────────────────────────────────────────────────────────────────
+
+def _file_tree(arg: str) -> str:
+    """Return a numbered hierarchical tree of a directory."""
+    # arg may be "C:/Users" or "C:/Users:2" (path:depth)
+    # Split off trailing :N depth if present
+    max_depth = _DEFAULT_MAX_DEPTH
+    path_str = arg.strip().strip("\"'")
+
+    # If the last component looks like a digit, treat as depth
+    if path_str:
+        last_colon = path_str.rfind(":")
+        # Check that it's not a Windows drive letter (single char before colon)
+        if last_colon > 1:
+            candidate = path_str[last_colon + 1:]
+            if candidate.isdigit():
+                max_depth = max(1, min(6, int(candidate)))
+                path_str = path_str[:last_colon]
+
+    if not path_str:
+        path_str = os.path.expanduser("~")
+
+    p = Path(path_str)
+    if not p.exists():
+        return f"Path not found: {path_str}"
+    if not p.is_dir():
+        try:
+            size = p.stat().st_size
+            return f"File: {p.name} ({_fmt_size(size)})\nFull path: {p.resolve()}"
+        except OSError:
+            return f"File: {p.name}\nFull path: {p.resolve()}"
+
+    lines: List[str] = [f"ROOT: {p.resolve()}"]
+    counter = [0]
+    item_count = [0]
+
+    def recurse(directory: Path, depth: int, parent_num: str) -> None:
+        if depth > max_depth or item_count[0] >= _MAX_TREE_ITEMS:
+            return
+        try:
+            raw_entries = list(directory.iterdir())
+        except PermissionError:
+            indent = "  " * depth
+            lines.append(f"{indent}[permission denied]")
+            return
+
+        # Folders first, then files, both sorted alphabetically
+        entries = sorted(raw_entries, key=lambda e: (not e.is_dir(), e.name.lower()))
+
+        sibling = 0
+        for entry in entries:
+            if item_count[0] >= _MAX_TREE_ITEMS:
+                indent = "  " * depth
+                lines.append(f"{indent}... (truncated — use a narrower path or smaller depth)")
+                return
+            sibling += 1
+            item_count[0] += 1
+
+            # Build the dotted number: "1", "1.2", "1.2.3", etc.
+            num = f"{parent_num}.{sibling}" if parent_num else str(sibling)
+
+            # Depth arrows: "" at root, ">" one level in, ">>" two levels, etc.
+            arrows = ">" * depth
+            indent = "  " * depth
+
+            if entry.is_dir():
+                lines.append(f"{indent}[{arrows}{num}] {entry.name}/")
+                recurse(entry, depth + 1, num)
+            else:
+                try:
+                    size = entry.stat().st_size
+                    lines.append(f"{indent}[{arrows}{num}] {entry.name} ({_fmt_size(size)})")
+                except OSError:
+                    lines.append(f"{indent}[{arrows}{num}] {entry.name}")
+
+    recurse(p, 0, "")
+
+    if item_count[0] >= _MAX_TREE_ITEMS:
+        lines.append(f"\n(Showing first {_MAX_TREE_ITEMS} items. Narrow the path or reduce depth.)")
+
+    lines.append(f"\n(Depth shown: {max_depth}. To go deeper: [QUERY:FILE_TREE:{path_str}:{max_depth + 1}])")
+    return "\n".join(lines)
+
+
+def _fmt_size(b: int) -> str:
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1024 ** 2:
+        return f"{b / 1024:.1f} KB"
+    elif b < 1024 ** 3:
+        return f"{b / (1024 ** 2):.1f} MB"
+    else:
+        return f"{b / (1024 ** 3):.1f} GB"
+
+
+# ── Page source ──────────────────────────────────────────────────────────────
+
+_BROWSER_PROCS = ["chrome", "msedge", "firefox", "brave", "opera", "vivaldi", "arc"]
+_PAGE_SOURCE_MAX_CHARS = 12_000
+
+# PowerShell: find browser windows and extract URL from address bar via UIA
+_PS_GET_BROWSER_URLS = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$scope  = [System.Windows.Automation.TreeScope]::Children
+$descScope = [System.Windows.Automation.TreeScope]::Descendants
+$editType = [System.Windows.Automation.ControlType]::Edit
+$browsers = @("chrome","msedge","firefox","brave","opera","vivaldi","arc")
+$results = @()
+foreach ($name in $browsers) {
+    $procs = Get-Process -Name $name -ErrorAction SilentlyContinue
+    foreach ($proc in $procs) {
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
+        $wins = $root.FindAll($scope, $cond)
+        foreach ($win in $wins) {
+            $title = $win.Current.Name
+            if (-not $title) { continue }
+            $editCond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::ControlTypeProperty, $editType)
+            $edits = $win.FindAll($descScope, $editCond)
+            foreach ($edit in $edits) {
+                try {
+                    $vp = $edit.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                    $val = $vp.Current.Value
+                    if ($val -match "^https?://") {
+                        $results += "BROWSER=$name|TITLE=$title|URL=$val"
+                        break
+                    }
+                } catch {}
+            }
+        }
+    }
+}
+if ($results.Count -eq 0) { "NONE" } else { $results -join "`n" }
+"""
+
+
+def _page_source(target: str) -> str:
+    """Fetch the HTML source of a browser tab, optionally matched by title."""
+    target = target.strip()
+
+    # Get URLs from all open browser windows
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", _PS_GET_BROWSER_URLS],
+            capture_output=True, text=True, timeout=15,
+        )
+        raw = proc.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return "Browser URL lookup timed out."
+    except FileNotFoundError:
+        return "PowerShell not available."
+    except Exception as exc:
+        return f"Browser lookup failed: {exc}"
+
+    if not raw or raw == "NONE":
+        return (
+            "No browser window found. "
+            "Make sure Chrome, Edge, Firefox, or Brave is open."
+        )
+
+    # Parse the results
+    tabs: list[dict] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = {}
+        for chunk in line.split("|"):
+            if "=" in chunk:
+                k, _, v = chunk.partition("=")
+                parts[k.strip()] = v.strip()
+        if "URL" in parts and "TITLE" in parts:
+            tabs.append(parts)
+
+    if not tabs:
+        return "Could not extract URLs from browser windows."
+
+    # Pick the right tab
+    if target:
+        tl = target.lower()
+        match = next(
+            (t for t in tabs if tl in t["TITLE"].lower() or tl in t["URL"].lower()),
+            None,
+        )
+        if match is None:
+            available = "\n".join(f"  - {t['TITLE']} ({t['URL'][:60]})" for t in tabs[:10])
+            return f"No tab matching '{target}' found. Open tabs:\n{available}"
+    else:
+        # No target — use the first (most recently active) tab found
+        match = tabs[0]
+
+    url = match["URL"]
+    title = match["TITLE"]
+
+    # Fetch the page
+    return _fetch_and_clean(url, title)
+
+
+def _fetch_and_clean(url: str, title: str) -> str:
+    """Fetch a URL and return cleaned source suitable for LLM reading."""
+    import re as _re
+    import urllib.request
+    import urllib.error
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    }
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            # Only read text content types
+            ctype = resp.headers.get("Content-Type", "")
+            if "text" not in ctype and "json" not in ctype:
+                return f"Page at '{title}' has non-text content type ({ctype}). Can't read source."
+            raw_html = resp.read(500_000).decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return f"HTTP {exc.code} fetching {url}"
+    except urllib.error.URLError as exc:
+        return f"Could not fetch page: {exc.reason}"
+    except Exception as exc:
+        return f"Fetch failed: {exc}"
+
+    # Strip <script> blocks
+    cleaned = _re.sub(r"<script\b[^>]*>.*?</script>", "", raw_html, flags=_re.DOTALL | _re.IGNORECASE)
+    # Strip <style> blocks
+    cleaned = _re.sub(r"<style\b[^>]*>.*?</style>", "", cleaned, flags=_re.DOTALL | _re.IGNORECASE)
+    # Strip HTML comments
+    cleaned = _re.sub(r"<!--.*?-->", "", cleaned, flags=_re.DOTALL)
+    # Collapse whitespace runs
+    cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = _re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = cleaned.strip()
+
+    truncated = False
+    if len(cleaned) > _PAGE_SOURCE_MAX_CHARS:
+        cleaned = cleaned[:_PAGE_SOURCE_MAX_CHARS]
+        truncated = True
+
+    header = f"=== PAGE SOURCE: {title} ===\nURL: {url}\n\n"
+    footer = "\n\n... (truncated — source continues beyond this point)" if truncated else ""
+    return header + cleaned + footer
+
+
+# ── Clipboard history ─────────────────────────────────────────────────────────
+
+def _clipboard_history() -> str:
+    """Read Windows 10 clipboard history via WinRT through PowerShell."""
+    ps = r"""
+try {
+    $null = [Windows.ApplicationModel.DataTransfer.Clipboard, Windows.ApplicationModel.DataTransfer, ContentType=WindowsRuntime]
+    $task = [Windows.ApplicationModel.DataTransfer.Clipboard]::GetHistoryItemsAsync()
+    $result = $task.GetAwaiter().GetResult()
+    if ($result.Status -ne 0) {
+        "Clipboard history unavailable (status $($result.Status)). Enable it in Settings > System > Clipboard."
+        return
+    }
+    $items = $result.Items
+    if ($items.Count -eq 0) {
+        "Clipboard history is empty."
+        return
+    }
+    $out = @()
+    $i = 1
+    foreach ($item in $items) {
+        if ($i -gt 25) { break }
+        $content = $item.Content
+        if ($content.Contains('Text')) {
+            try {
+                $text = $content.GetTextAsync().GetAwaiter().GetResult()
+                $text = $text.Trim()
+                if ($text.Length -gt 600) { $text = $text.Substring(0, 600) + "..." }
+                if ($text.Length -gt 0) {
+                    $out += "[$i] $text"
+                    $i++
+                }
+            } catch {}
+        }
+    }
+    if ($out.Count -eq 0) { "No text items in clipboard history." }
+    else { $out -join "`n---`n" }
+} catch {
+    "Error reading clipboard history: $_"
+}
+"""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=12,
+        )
+        out = proc.stdout.strip()
+        if out:
+            return out
+        err = proc.stderr.strip()
+        if err:
+            return _clipboard_fallback(f"PowerShell error: {err[:150]}")
+        return _clipboard_fallback("No output from PowerShell")
+    except subprocess.TimeoutExpired:
+        return _clipboard_fallback("clipboard history query timed out")
+    except FileNotFoundError:
+        return _clipboard_fallback("PowerShell not found")
+    except Exception as exc:
+        return _clipboard_fallback(str(exc))
+
+
+def _clipboard_fallback(reason: str) -> str:
+    """Fall back to reading just the current clipboard item."""
+    try:
+        import win32clipboard  # type: ignore
+        win32clipboard.OpenClipboard()
+        try:
+            text = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+            preview = text[:1000] if len(text) > 1000 else text
+            return (
+                f"[Full history unavailable: {reason}]\n"
+                f"Current clipboard:\n{preview}"
+            )
+        except Exception:
+            return f"[Clipboard unreadable: {reason}]"
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception as e:
+        return f"[Cannot read clipboard: {reason} / {e}]"
+
+
+# ── Read Notepad ──────────────────────────────────────────────────────────────
+
+def _read_notepad() -> str:
+    """Read text from any open Notepad window(s)."""
+    results: List[Tuple[str, str]] = []
+
+    # ── Strategy 1: classic Notepad (Windows 10, Edit control) ──────────────
+    try:
+        import win32gui  # type: ignore
+        import win32con  # type: ignore
+        import win32api  # type: ignore
+
+        def _enum(hwnd: int, _: object) -> bool:
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            classname = win32gui.GetClassName(hwnd)
+            title = win32gui.GetWindowText(hwnd)
+            if classname == "Notepad":
+                edit = win32gui.FindWindowEx(hwnd, 0, "Edit", None)
+                if edit:
+                    try:
+                        length = win32api.SendMessage(edit, win32con.WM_GETTEXTLENGTH, 0, 0)
+                        if length > 0:
+                            buf = ctypes.create_unicode_buffer(length + 1)
+                            win32api.SendMessage(edit, win32con.WM_GETTEXT, length + 1, buf)
+                            content = buf.value
+                            if content.strip():
+                                results.append((title or "Notepad", content))
+                    except Exception as exc:
+                        logger.debug("Notepad Edit read failed: %s", exc)
+            return True
+
+        win32gui.EnumWindows(_enum, None)
+    except Exception as exc:
+        logger.debug("Classic Notepad scan failed: %s", exc)
+
+    # ── Strategy 2: Windows 11 Notepad via UI Automation (PowerShell) ───────
+    if not results:
+        results.extend(_read_notepad_uia())
+
+    if not results:
+        return "No Notepad window found. Open Notepad and try again."
+
+    parts = []
+    for title, content in results[:3]:
+        if len(content) > 5000:
+            content = content[:5000] + "\n... (truncated at 5000 chars)"
+        parts.append(f"=== {title} ===\n{content}")
+
+    return "\n\n".join(parts)
+
+
+def _read_notepad_uia() -> List[Tuple[str, str]]:
+    """Read Notepad via UI Automation — works on Windows 11 new Notepad."""
+    ps = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$scope = [System.Windows.Automation.TreeScope]::Children
+$desc = [System.Windows.Automation.TreeScope]::Descendants
+$found = @()
+
+# Find windows whose process name is "notepad"
+$procs = Get-Process -Name "notepad" -ErrorAction SilentlyContinue
+foreach ($proc in $procs) {
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ProcessIdProperty, $proc.Id)
+    $win = $root.FindFirst($scope, $cond)
+    if ($null -eq $win) { continue }
+
+    $title = $win.Current.Name
+
+    # Look for a Document or Edit control type
+    $docCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Document)
+    $editCond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Edit)
+
+    foreach ($ctype in @($docCond, $editCond)) {
+        $el = $win.FindFirst($desc, $ctype)
+        if ($null -eq $el) { continue }
+        try {
+            $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+            $text = $tp.DocumentRange.GetText(-1)
+        } catch {
+            try {
+                $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                $text = $vp.Current.Value
+            } catch { $text = "" }
+        }
+        if ($text.Trim().Length -gt 0) {
+            if ($text.Length -gt 5000) { $text = $text.Substring(0, 5000) + "..." }
+            $found += "===TITLE===$title===CONTENT===$text===END==="
+            break
+        }
+    }
+}
+
+if ($found.Count -eq 0) { "" } else { $found -join "`n|||`n" }
+"""
+    results: List[Tuple[str, str]] = []
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=12,
+        )
+        out = proc.stdout.strip()
+        if not out:
+            return results
+        for chunk in out.split("\n|||\n"):
+            chunk = chunk.strip()
+            if "===TITLE===" in chunk and "===CONTENT===" in chunk:
+                try:
+                    title = chunk.split("===TITLE===")[1].split("===CONTENT===")[0]
+                    content = chunk.split("===CONTENT===")[1].split("===END===")[0]
+                    if content.strip():
+                        results.append((title.strip(), content.strip()))
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.debug("UIA Notepad read failed: %s", exc)
+    return results
