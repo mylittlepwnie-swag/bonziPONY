@@ -22,7 +22,7 @@ class VisionProvider:
         self,
         api_keys: List[str],
         model: str = "gemini-2.5-flash",
-        base_url: str = "https://generativelanguage.googleapis.com/v1beta/openai",
+        base_url: Optional[str] = "https://generativelanguage.googleapis.com/v1beta/openai",
         max_requests_per_key_per_day: int = 100,
         temperature: float = 0.3,
         max_tokens: int = 500,
