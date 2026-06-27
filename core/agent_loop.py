@@ -4517,8 +4517,13 @@ class AgentLoop:
         """Occasionally take a screenshot for richer context. Returns description or None.
 
         Respects vision.screen_vision setting:
-        - "moondream": use local model (only if loaded), fall back to API
-        - "api": always use the main LLM's describe_screen
+        - "moondream": use local model (only if loaded), fall back below
+        - "api": prefer the dedicated `vision_llm` model if configured,
+                 otherwise the main LLM's describe_screen.
+
+        Routing precedence: moondream (if selected & loaded) → dedicated
+        vision model (self._vision_llm) → main LLM. This means a text-only
+        main model never gets handed a screenshot as long as vision_llm is set.
         """
         if self._screen is None:
             return None

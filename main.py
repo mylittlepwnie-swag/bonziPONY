@@ -59,6 +59,56 @@ def setup_logging(level: str, log_to_file: bool, log_file: str) -> None:
     )
 
 
+def build_vision_provider(vlm_cfg, main_llm_cfg):
+    """Construct the dedicated screen/webcam vision model, or return None.
+
+    This is a *separate*, vision-capable model used for screen descriptions
+    (``describe_screen``) and webcam (``describe_image``). Wiring it up lets
+    the main chat model be a text-only model that doesn't support images —
+    screen vision no longer hits the main LLM.
+
+    base_url resolution order:
+      1. explicit ``vision_llm.base_url``
+      2. well-known URL for the named provider (openrouter, groq, gemini, …)
+      3. if the vision model is on the same provider as the main LLM, reuse
+         the main LLM's base_url (so a vision-capable sibling model on the
+         same endpoint "just works" with only model + api_key)
+      4. ``None`` → the OpenAI SDK default (api.openai.com), except for
+         gemini/google which use the Gemini OpenAI-compatible endpoint.
+    """
+    if not (vlm_cfg and vlm_cfg.enabled and vlm_cfg.api_keys):
+        return None
+
+    from llm.vision_provider import VisionProvider
+    from llm.factory import _KNOWN_BASE_URLS
+
+    logger = logging.getLogger(__name__)
+    provider_l = (vlm_cfg.provider or "").lower()
+    base_url = vlm_cfg.base_url or _KNOWN_BASE_URLS.get(provider_l)
+
+    # Vision model shares the main LLM's endpoint? Inherit its base_url so the
+    # user only has to name the vision model (and supply a key).
+    if not base_url and main_llm_cfg and provider_l in ("", main_llm_cfg.provider.lower()):
+        base_url = main_llm_cfg.base_url or None
+
+    # Gemini/Google's OpenAI-compatible API lives under the /openai suffix.
+    if not base_url and provider_l in ("gemini", "google"):
+        base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+    if base_url and "generativelanguage.googleapis.com" in base_url and not base_url.rstrip("/").endswith("/openai"):
+        base_url = base_url.rstrip("/") + "/openai"
+        logger.info("Auto-corrected Gemini base_url to include /openai suffix")
+
+    return VisionProvider(
+        api_keys=vlm_cfg.api_keys,
+        model=vlm_cfg.model,
+        base_url=base_url,
+        max_requests_per_key_per_day=vlm_cfg.max_requests_per_key_per_day,
+        temperature=vlm_cfg.temperature,
+        max_tokens=vlm_cfg.max_tokens,
+        locate_max_tokens=vlm_cfg.locate_max_tokens,
+    )
+
+
 def main() -> None:
     # ── Optional .env loading (pip install python-dotenv) ─────────────────────
     try:
@@ -202,31 +252,19 @@ def main() -> None:
 
     llm_provider = get_provider(config)
 
-    # ── Dedicated vision LLM (optional — uses separate, cheaper model) ────
+    # ── Dedicated vision model (optional — separate, vision-capable model) ─
+    # Screen vision (describe_screen) and webcam (describe_image) are routed
+    # through this model, so the main chat model can be a text-only model
+    # that doesn't support images.
     vision_llm = None
     vlm_cfg = config.vision_llm
-    if vlm_cfg and vlm_cfg.enabled and vlm_cfg.api_keys:
-        try:
-            from llm.vision_provider import VisionProvider
-            from llm.factory import _KNOWN_BASE_URLS
-            base_url = vlm_cfg.base_url or _KNOWN_BASE_URLS.get(vlm_cfg.provider.lower())
-            # Gemini requires the /openai suffix for OpenAI-compatible API
-            if base_url and "generativelanguage.googleapis.com" in base_url and not base_url.rstrip("/").endswith("/openai"):
-                base_url = base_url.rstrip("/") + "/openai"
-                logger.info("Auto-corrected Gemini base_url to include /openai suffix")
-            vision_llm = VisionProvider(
-                api_keys=vlm_cfg.api_keys,
-                model=vlm_cfg.model,
-                base_url=base_url or "https://generativelanguage.googleapis.com/v1beta/openai",
-                max_requests_per_key_per_day=vlm_cfg.max_requests_per_key_per_day,
-                temperature=vlm_cfg.temperature,
-                max_tokens=vlm_cfg.max_tokens,
-                locate_max_tokens=vlm_cfg.locate_max_tokens,
-            )
-            logger.info("Dedicated vision LLM: %s (%d keys)", vlm_cfg.model, len(vlm_cfg.api_keys))
-        except Exception as exc:
-            logger.warning("Failed to init vision LLM, falling back to main LLM: %s", exc)
-            vision_llm = None
+    try:
+        vision_llm = build_vision_provider(vlm_cfg, config.llm)
+        if vision_llm:
+            logger.info("Dedicated vision model: %s (%d key(s))", vlm_cfg.model, len(vlm_cfg.api_keys))
+    except Exception as exc:
+        logger.warning("Failed to init vision model, falling back to main LLM: %s", exc)
+        vision_llm = None
 
     # ── TTS provider selection ─────────────────────────────────────────────
     # Read-only mode: force openai_compatible. ElevenLabs is a cloud provider
@@ -640,29 +678,15 @@ def main() -> None:
     def _on_vision_llm_change() -> None:
         nonlocal vision_llm
         vlm_cfg = config.vision_llm
-        if vlm_cfg and vlm_cfg.enabled and vlm_cfg.api_keys:
-            try:
-                from llm.vision_provider import VisionProvider
-                from llm.factory import _KNOWN_BASE_URLS
-                base_url = vlm_cfg.base_url or _KNOWN_BASE_URLS.get(vlm_cfg.provider.lower())
-                if base_url and "generativelanguage.googleapis.com" in base_url and not base_url.rstrip("/").endswith("/openai"):
-                    base_url = base_url.rstrip("/") + "/openai"
-                vision_llm = VisionProvider(
-                    api_keys=vlm_cfg.api_keys,
-                    model=vlm_cfg.model,
-                    base_url=base_url or "https://generativelanguage.googleapis.com/v1beta/openai",
-                    max_requests_per_key_per_day=vlm_cfg.max_requests_per_key_per_day,
-                    temperature=vlm_cfg.temperature,
-                    max_tokens=vlm_cfg.max_tokens,
-                    locate_max_tokens=vlm_cfg.locate_max_tokens,
-                )
-                logger.info("Vision LLM reloaded: %s (%d keys)", vlm_cfg.model, len(vlm_cfg.api_keys))
-            except Exception as exc:
-                logger.warning("Failed to reload vision LLM: %s", exc)
-                vision_llm = None
-        else:
+        try:
+            vision_llm = build_vision_provider(vlm_cfg, config.llm)
+            if vision_llm:
+                logger.info("Vision model reloaded: %s (%d key(s))", vlm_cfg.model, len(vlm_cfg.api_keys))
+            else:
+                logger.info("Vision model disabled")
+        except Exception as exc:
+            logger.warning("Failed to reload vision model: %s", exc)
             vision_llm = None
-            logger.info("Vision LLM disabled")
         # Update references
         pipeline.vision_llm = vision_llm
         if agent_loop:

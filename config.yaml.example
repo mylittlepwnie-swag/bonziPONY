@@ -43,7 +43,32 @@ vision:
   device_index: 0              # webcam index (0 = default camera)
   screen_capture: true         # enable screenshot capture
   screen_max_width: 1280       # downscale screenshots to this width
-  screen_vision: api           # "api" = LLM describe_screen, "moondream" = local model (~2GB RAM)
+  screen_vision: api           # "moondream" = local model (~2GB RAM), or
+                               # "api" = use the `vision_llm` model below if set,
+                               #         else the main LLM's describe_screen.
+
+# ── Separate vision model (optional) ────────────────────────────────────
+# Use a DIFFERENT, vision-capable model for screen descriptions (and webcam)
+# than your main chat model. Enable this when your main `llm.model` does NOT
+# support image inputs (e.g. you see "model does not support image inputs").
+# When enabled, BOTH screen vision (describe_screen) and webcam
+# (describe_image) go through this model instead of the main LLM.
+vision_llm:
+  enabled: false
+  provider: openai             # any OpenAI-compatible provider (openai, openrouter,
+                               # gemini, groq, zai, …) or your main provider's name
+  model: ""                    # a vision-capable model, e.g. "gpt-4o-mini",
+                               # "google/gemini-2.5-flash", "glm-4v", etc.
+  # base_url: ""               # optional. If omitted: a known provider URL is used;
+                               # if the provider matches your main `llm.provider`,
+                               # the main `llm.base_url` is reused; otherwise the
+                               # OpenAI default (api.openai.com) applies.
+  api_key: ""                  # single key (use the same key as your main provider
+                               # if the vision model lives on the same endpoint)
+  # api_keys: ["key1", "key2"] # OR multiple keys to round-robin (rate-limit spread)
+  max_requests_per_key_per_day: 100
+  temperature: 0.3
+  max_tokens: 2048             # high default covers Gemini "thinking" overhead
 
 conversation:
   timeout_s: 60                # seconds to stay in conversation mode after speaking

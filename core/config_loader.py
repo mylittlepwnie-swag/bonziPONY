@@ -83,7 +83,14 @@ class VisionConfig:
     device_index: int = 0
     screen_capture: bool = True
     screen_max_width: int = 1280
-    screen_vision: str = "api"  # "api" = main LLM describe_screen, "moondream" = local model
+    # Screen-vision backend selection:
+    #   "moondream" = local model (~2GB RAM), no API cost
+    #   "api"       = use the dedicated `vision_llm` model if configured,
+    #                 otherwise fall back to the main LLM's describe_screen.
+    # NOTE: configure the top-level `vision_llm` block to point screen vision
+    # at a separate, vision-capable model (so the main chat model can be a
+    # text-only model with no image support).
+    screen_vision: str = "api"
 
 
 @dataclass
