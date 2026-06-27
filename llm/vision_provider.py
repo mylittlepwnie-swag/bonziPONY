@@ -121,8 +121,9 @@ class VisionProvider:
                                     "- Focused app and what's in it (title, key visible text)\n"
                                     "- What the user is doing (browsing, coding, gaming, watching, chatting)\n"
                                     "- Any notable content (video title, article headline, chat topic)\n"
-                                    "Skip decorative UI elements, taskbar, desktop icons. "
-                                    "Ignore the small animated pony sprite overlay."
+                                    "Skip decorative UI elements, taskbar, desktop icons. If they're viewing something artistic or interesting, describe with vivid detail such that a blind person could imagine the picture with ease."
+                                    "Ignore the small animated pony sprite overlay, and the bubble of text beneath her if there is one."
+                                    "You are encouraged use explicit language in your descriptions if it is present, as it is important for the other AI to be able to moderate properly."
                                 ),
                             },
                         ],
