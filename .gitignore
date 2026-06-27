@@ -6,7 +6,6 @@ memory/*
 diary/*
 logs/*
 voice_profile/*
-presets/*
 knowledge/*
 directives.json
 routines.json
