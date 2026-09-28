@@ -68,6 +68,9 @@ class OpenAIProvider(LLMProvider):
     def chat(self, user_message: str) -> str:
         self._history.append({"role": "user", "content": user_message})
         self._trim_history()
+        # Keep data-bank notes across the history within the token budget.
+        from core.knowledge import enforce_history_budget
+        enforce_history_budget(self._history)
 
         _prompt_fn = self.system_prompt_fn or get_system_prompt
         messages = [{"role": "system", "content": _prompt_fn()}]

@@ -840,6 +840,17 @@ class ContextMenuBuilder:
             ("Moondream (Local)", "moondream"),
         ], cfg.vision.screen_vision, lambda v: self._set_screen_vision(v))
 
+        # ── Data bank token budget (per LLM request) ──────────────────
+        self._radio_submenu(menu, "Data Bank Budget", [
+            ("Off", 0),
+            ("1,000 tokens", 1000),
+            ("2,000 tokens", 2000),
+            ("4,000 tokens (default)", 4000),
+            ("8,000 tokens", 8000),
+            ("16,000 tokens", 16000),
+        ], cfg.knowledge.token_budget,
+            lambda v: self._set_knowledge_budget(v))
+
         menu.addSeparator()
 
         # ── Activity Level submenu (scales ALL timing) ────────────────
@@ -1065,6 +1076,12 @@ class ContextMenuBuilder:
         setattr(obj, key, value)
         _save_yaml_value(f"{section}.{key}", value, self.config_path)
         logger.info("Config: %s.%s = %s", section, key, value)
+
+    def _set_knowledge_budget(self, tokens: int) -> None:
+        """Change how many data-bank tokens go into each LLM request (live)."""
+        from core.knowledge import set_token_budget
+        self._set("knowledge", "token_budget", int(tokens))
+        set_token_budget(int(tokens))
 
     def _set_activity_level(self, multiplier: float) -> None:
         """Scale ALL timing settings from a single activity multiplier."""

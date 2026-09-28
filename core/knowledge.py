@@ -21,6 +21,7 @@ Public API:
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -39,6 +40,18 @@ _CONTEXT_CHARS = 240          # chars of surrounding context shown per hit
 _MAX_RESULTS = 8              # matches returned by default
 _MAX_FILE_CHARS = 8000        # cap when reading a whole file
 _MAX_FILE_BYTES = 1_000_000   # skip files larger than this when searching
+
+# Token budget for data-bank text in any single main-LLM request (auto-retrieved
+# notes, including copies still riding along in the conversation history).
+# Set from config `knowledge.token_budget`; 0 disables auto-retrieval.
+_DEFAULT_TOKEN_BUDGET = 4000
+_token_budget = _DEFAULT_TOKEN_BUDGET
+_CHARS_PER_TOKEN = 4          # rough, provider-agnostic estimate
+_MAX_RETRIEVE_CHUNKS = 64     # hard cap on chunks pulled to fill the budget
+
+_BLOCK_OPEN = "[FROM YOUR DATA BANK"
+_BLOCK_CLOSE = "[/DATA BANK]"
+_BLOCK_RE = re.compile(r"\n*" + re.escape(_BLOCK_OPEN) + r".*?" + re.escape(_BLOCK_CLOSE), re.S)
 
 _SEED_README = """\
 This is your pony's data bank.
@@ -196,19 +209,64 @@ def _keyword_search(query: str, max_results: int = _MAX_RESULTS) -> str:
     return header + "\n" + "\n".join(hits) + footer
 
 
-def retrieve_context_block(query: str, top_k: int = 3) -> str:
+# ── token budget ───────────────────────────────────────────────────────────
+
+def set_token_budget(tokens: int) -> None:
+    """Max data-bank tokens per main-LLM request (0 = no auto-retrieval)."""
+    global _token_budget
+    _token_budget = max(0, int(tokens or 0))
+
+
+def get_token_budget() -> int:
+    return _token_budget
+
+
+def estimate_tokens(text: str) -> int:
+    return (len(text or "") + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
+
+
+def enforce_history_budget(history: list) -> None:
+    """Strip the oldest auto-retrieved data-bank blocks from *history* (in
+    place) until all of them together fit the token budget.
+
+    Newest blocks are kept first, so the notes for the current message always
+    survive. Called by the LLM providers right before each chat request.
+    """
+    budget = _token_budget
+    blocks = []  # (message index, token cost) oldest → newest
+    for i, msg in enumerate(history):
+        content = msg.get("content")
+        if msg.get("role") == "user" and isinstance(content, str) and _BLOCK_OPEN in content:
+            cost = sum(estimate_tokens(m.group(0)) for m in _BLOCK_RE.finditer(content))
+            if cost:
+                blocks.append((i, cost))
+    total = sum(c for _, c in blocks)
+    for i, cost in blocks:
+        if total <= budget:
+            break
+        history[i] = {**history[i], "content": _BLOCK_RE.sub("", history[i]["content"])}
+        total -= cost
+
+
+def retrieve_context_block(query: str, token_budget: Optional[int] = None) -> str:
     """Relevant data-bank chunks for *query*, formatted for prompt injection.
 
-    Returns an empty string when nothing is relevant (or semantic search is
-    unavailable) so callers can cheaply skip injection. This is the
-    auto-retrieval that fires each conversation turn — the SillyTavern-style
-    "feed the model relevant memories without being asked" behavior.
+    Pulls as many relevant chunks as fit in *token_budget* (default: the
+    configured budget). Returns an empty string when nothing is relevant,
+    semantic search is unavailable, or the budget is 0 — so callers can
+    cheaply skip injection. This is the auto-retrieval that fires each
+    conversation turn — the SillyTavern-style "feed the model relevant
+    memories without being asked" behavior.
     """
+    budget = _token_budget if token_budget is None else max(0, int(token_budget))
     query = (query or "").strip()
-    if len(query) < 3:
+    if len(query) < 3 or budget <= 0:
         return ""
     try:
         from core.knowledge_index import semantic_search
+        # Enough candidates to fill the budget (chunks are ~600 chars);
+        # weak matches are still filtered out by the similarity floor.
+        top_k = min(_MAX_RETRIEVE_CHUNKS, budget * _CHARS_PER_TOKEN // 500 + 1)
         hits = semantic_search(query, top_k=top_k)
     except Exception as exc:
         logger.debug("retrieve_context_block failed: %s", exc)
@@ -216,18 +274,24 @@ def retrieve_context_block(query: str, top_k: int = 3) -> str:
     if not hits:
         return ""
 
-    parts = []
-    for h in hits:
-        snippet = h.text.strip()
-        if len(snippet) > 500:
-            snippet = snippet[:500] + "..."
-        parts.append(f"- (from {h.file}) {snippet}")
-    body = "\n".join(parts)
-    return (
-        "[FROM YOUR DATA BANK — notes you remember that may be relevant here. "
-        "Use naturally if it helps; ignore if not. Don't say you looked it up.]\n"
-        f"{body}\n[/DATA BANK]"
+    header = (
+        f"{_BLOCK_OPEN} — notes you remember that may be relevant here. "
+        "Use naturally if it helps; ignore if not. Don't say you looked it up.]"
     )
+    remaining = budget * _CHARS_PER_TOKEN - len(header) - len(_BLOCK_CLOSE) - 2
+    parts = []
+    for h in hits:  # best match first
+        line = f"- (from {h.file}) {h.text.strip()}"
+        if len(line) + 1 > remaining:
+            if not parts and remaining > 80:
+                parts.append(line[:remaining - 4] + "...")  # at least the top hit
+            break
+        parts.append(line)
+        remaining -= len(line) + 1
+    if not parts:
+        return ""
+    body = "\n".join(parts)
+    return f"{header}\n{body}\n{_BLOCK_CLOSE}"
 
 
 def read_topic(name: str) -> str:
