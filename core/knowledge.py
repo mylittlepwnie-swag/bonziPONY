@@ -248,6 +248,21 @@ def enforce_history_budget(history: list) -> None:
         total -= cost
 
 
+def wrap_for_budget(text: str) -> str:
+    """Fit an on-demand lookup result ([QUERY:KNOWLEDGE...]) into the token
+    budget and mark it as data-bank content, so it's counted — and later
+    dropped oldest-first — alongside auto-retrieved notes."""
+    budget = _token_budget
+    if budget <= 0:
+        return ("Your data bank budget is set to Off, so you can't look anything "
+                "up right now. The user can raise it in the right-click menu.")
+    header = f"{_BLOCK_OPEN} — lookup result]"
+    room = budget * _CHARS_PER_TOKEN - len(header) - len(_BLOCK_CLOSE) - 2
+    if len(text) > room:
+        text = text[:max(0, room - 40)] + "\n... (cut off at your token budget)"
+    return f"{header}\n{text}\n{_BLOCK_CLOSE}"
+
+
 def retrieve_context_block(query: str, token_budget: Optional[int] = None) -> str:
     """Relevant data-bank chunks for *query*, formatted for prompt injection.
 
@@ -294,7 +309,7 @@ def retrieve_context_block(query: str, token_budget: Optional[int] = None) -> st
     return f"{header}\n{body}\n{_BLOCK_CLOSE}"
 
 
-def read_topic(name: str) -> str:
+def read_topic(name: str, max_chars: int = _MAX_FILE_CHARS) -> str:
     """Read one note file by name (with or without extension)."""
     name = (name or "").strip().strip("\"'")
     if not name:
@@ -325,9 +340,9 @@ def read_topic(name: str) -> str:
     except OSError as exc:
         return f"Couldn't read {target.name}: {exc}"
 
-    truncated = len(text) > _MAX_FILE_CHARS
+    truncated = len(text) > max_chars
     if truncated:
-        text = text[:_MAX_FILE_CHARS]
+        text = text[:max_chars]
     header = f"=== {target.name} ==="
     footer = "\n... (truncated — file continues)" if truncated else ""
     return f"{header}\n{text}{footer}"

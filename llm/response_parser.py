@@ -107,7 +107,7 @@ _RULE_PATTERN = re.compile(r"\[RULE:([^\]]+)\]", re.IGNORECASE)
 _DIARY_PATTERN = re.compile(r"\[DIARY:([^\]]+)\]", re.IGNORECASE)
 
 # Catch-all: strip any remaining [TAG:...] bracket expressions the LLM may produce
-_LEFTOVER_TAG_PATTERN = re.compile(r"\[(?:MOVETO|PERSIST|ANIM|ACTION|CONVO|DESKTOP|DIRECTIVE|TIMER|ROUTINE|ENFORCE|DONE|DELAY|RULE|DIARY)\s*:[^\]]*\]", re.IGNORECASE)
+_LEFTOVER_TAG_PATTERN = re.compile(r"\[(?:MOVETO|PERSIST|ANIM|ACTION|CONVO|DESKTOP|DIRECTIVE|TIMER|ROUTINE|ENFORCE|DONE|DELAY|RULE|DIARY|QUERY)\s*:[^\]]*\]", re.IGNORECASE)
 
 # Strip <think>...</think> blocks from reasoning models (DeepSeek, QwQ, etc.)
 _THINK_BLOCK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
