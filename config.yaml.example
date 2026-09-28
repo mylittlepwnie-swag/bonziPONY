@@ -85,6 +85,14 @@ embeddings:
   api_key: ""                  # separate key (or set env BONZI_EMBEDDINGS_API_KEY)
   batch_size: 64               # chunks per API request
 
+# ── Data bank budget ────────────────────────────────────────────────────
+# Max tokens of data-bank notes sent to your main LLM in any one request
+# (auto-retrieved notes, counting ones still in the conversation history —
+# oldest get dropped first). 0 turns auto-retrieval off. Also settable from
+# the right-click menu → Data Bank Budget.
+knowledge:
+  token_budget: 4000
+
 conversation:
   timeout_s: 60                # seconds to stay in conversation mode after speaking
   listen_timeout_s: 4          # seconds to wait for user to START speaking in follow-up

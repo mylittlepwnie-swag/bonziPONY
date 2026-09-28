@@ -125,6 +125,15 @@ class EmbeddingsConfig:
 
 
 @dataclass
+class KnowledgeConfig:
+    """Data bank (knowledge/ folder) settings."""
+    # Max data-bank tokens sent to the main LLM in a single request (auto-
+    # retrieved notes, counting ones still in the conversation history).
+    # 0 turns auto-retrieval off.
+    token_budget: int = 4000
+
+
+@dataclass
 class DesktopControlConfig:
     enabled: bool = True
     allowed_apps: List[str] = field(default_factory=lambda: ["notepad", "calculator", "explorer"])
@@ -220,6 +229,7 @@ class AppConfig:
     tts: TTSConfig = None
     vision_llm: VisionLLMConfig = None
     embeddings: EmbeddingsConfig = None
+    knowledge: KnowledgeConfig = None
     multi_pony: MultiPonyConfig = None
     safety: SafetyConfig = None
     auto_update: bool = False              # auto-pull git updates on launch (off by default)
@@ -240,6 +250,8 @@ class AppConfig:
             self.vision_llm = VisionLLMConfig()
         if self.embeddings is None:
             self.embeddings = EmbeddingsConfig()
+        if self.knowledge is None:
+            self.knowledge = KnowledgeConfig()
         if self.multi_pony is None:
             self.multi_pony = MultiPonyConfig()
         if self.safety is None:
@@ -313,6 +325,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
     tts_raw = raw.get("tts", {})
     vlm_raw = raw.get("vision_llm", {})
     emb_raw = raw.get("embeddings", {})
+    kb_raw = raw.get("knowledge", {}) or {}
     mp_raw = raw.get("multi_pony", {})
     safety_raw = raw.get("safety", {})
     auto_update = bool(raw.get("auto_update", False))
@@ -431,6 +444,9 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
         ),
         vision_llm=_parse_vision_llm(vlm_raw or None),
         embeddings=_parse_embeddings(emb_raw or None),
+        knowledge=KnowledgeConfig(
+            token_budget=max(0, int(kb_raw.get("token_budget", 4000) or 0)),
+        ),
         multi_pony=MultiPonyConfig(
             max_ponies=mp_raw.get("max_ponies", 3),
             inter_pony_chat=mp_raw.get("inter_pony_chat", True),

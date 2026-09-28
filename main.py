@@ -161,6 +161,8 @@ def main() -> None:
         # instead of the local model — see the `embeddings:` config block.
         from core.knowledge_index import configure as _kb_configure
         _kb_configure(config.embeddings)
+        from core.knowledge import set_token_budget as _kb_set_budget
+        _kb_set_budget(config.knowledge.token_budget)
         # Build/refresh the semantic vector index off the main thread so the
         # embedding model load + embedding doesn't delay the pony appearing.
         # Falls back to keyword search silently if the model can't load.

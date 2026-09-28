@@ -408,6 +408,9 @@ class Pipeline:
 
             # Use chat() so the exchange lands in history — Dash will remember it
             raw = self.llm.chat(trigger)
+            if raw:
+                from core.query_tools import resolve_queries
+                raw = resolve_queries(self.llm, raw)
             if not raw:
                 return
 
@@ -722,6 +725,10 @@ class Pipeline:
                             hist.pop()
                             hist.pop()
                         raw_response = "hmm, uh, sorry I kinda spaced out for a second there. what were you saying? [CONVO:CONTINUE]"
+
+            # Run any silent [QUERY:...] lookups and get her real answer
+            from core.query_tools import resolve_queries
+            raw_response = resolve_queries(self.llm, raw_response)
 
             from llm.response_parser import parse_response
             parsed: ParsedResponse = parse_response(raw_response)
@@ -1367,6 +1374,9 @@ class Pipeline:
 
             # Use chat() so it enters history — Dash remembers what she saw
             raw = self.llm.chat(trigger)
+            if raw:
+                from core.query_tools import resolve_queries
+                raw = resolve_queries(self.llm, raw)
             if not raw:
                 return
 

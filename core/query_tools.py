@@ -23,6 +23,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import List, Tuple
@@ -34,6 +35,46 @@ _MAX_TREE_ITEMS = 150
 
 
 # ── Public entry point ────────────────────────────────────────────────────────
+
+QUERY_TAG_RE = re.compile(r"\[QUERY:[^\]\n]+\]", re.IGNORECASE)
+
+_MAX_QUERY_ROUNDS = 3         # lookups → results → maybe another lookup …
+_MAX_QUERIES_PER_ROUND = 3
+
+
+def resolve_queries(llm, raw: str) -> str:
+    """Run any [QUERY:...] tags in *raw* and feed the results back.
+
+    The pony emits a QUERY tag instead of answering; we execute it silently,
+    send the result back as the next chat turn, and return her real answer.
+    Repeats up to _MAX_QUERY_ROUNDS times if she chains lookups. Returns the
+    final raw response (unchanged if it had no QUERY tags).
+    """
+    for _ in range(_MAX_QUERY_ROUNDS):
+        tags = list(dict.fromkeys(QUERY_TAG_RE.findall(raw or "")))
+        if not tags:
+            return raw
+        results = []
+        for tag in tags[:_MAX_QUERIES_PER_ROUND]:
+            try:
+                result = execute_query(tag)
+            except Exception as exc:
+                logger.warning("Query %s failed: %s", tag, exc)
+                result = f"[Query failed: {exc}]"
+            logger.info("Query %s → %d chars", tag, len(result))
+            results.append(f"{tag}\n{result}")
+        followup = (
+            "[QUERY RESULTS — silent lookup, the user did NOT see this. Now reply "
+            "to them in character using what you found. Don't repeat the lookup.]\n\n"
+            + "\n\n".join(results)
+        )
+        next_raw = llm.chat(followup)
+        if not next_raw:
+            break
+        raw = next_raw
+    # Out of rounds (or empty reply): drop any leftover tags so they aren't spoken.
+    return QUERY_TAG_RE.sub("", raw or "").strip()
+
 
 def execute_query(query_tag: str) -> str:
     """
@@ -59,11 +100,13 @@ def execute_query(query_tag: str) -> str:
     elif qtype == "READ_FILE":
         return _read_file(rest)
     elif qtype == "KNOWLEDGE":
-        from core.knowledge import search as _kb_search
-        return _kb_search(rest)
+        # Result size scales with the data bank token budget (and is capped to it).
+        from core.knowledge import search as _kb_search, get_token_budget, wrap_for_budget
+        n = max(1, min(40, get_token_budget() * 4 // 500))
+        return wrap_for_budget(_kb_search(rest.strip(), max_results=n))
     elif qtype == "KNOWLEDGE_READ":
-        from core.knowledge import read_topic as _kb_read
-        return _kb_read(rest)
+        from core.knowledge import read_topic as _kb_read, get_token_budget, wrap_for_budget
+        return wrap_for_budget(_kb_read(rest, max_chars=max(500, get_token_budget() * 4)))
     elif qtype == "PAGE_SOURCE":
         return _page_source(rest)
     elif qtype == "CLIPBOARD_HISTORY":

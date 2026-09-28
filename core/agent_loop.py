@@ -3750,6 +3750,9 @@ class AgentLoop:
             )
             raw = self._llm.chat(prompt)
             if raw:
+                from core.query_tools import resolve_queries
+                raw = resolve_queries(self._llm, raw)
+            if raw:
                 from llm.response_parser import parse_response
                 parsed = parse_response(raw)
                 text = parsed.text
@@ -3821,6 +3824,9 @@ class AgentLoop:
 
             print(f"[Agent] Prompt: {trigger[:100]}...", flush=True)
             raw = self._llm.chat(trigger)
+            if raw:
+                from core.query_tools import resolve_queries
+                raw = resolve_queries(self._llm, raw)
             if raw:
                 from llm.response_parser import parse_response
                 parsed = parse_response(raw)
@@ -4235,6 +4241,8 @@ class AgentLoop:
                             hist.pop()
                         break
 
+                from core.query_tools import resolve_queries
+                raw = resolve_queries(self._llm, raw)
                 parsed = parse_response(raw)
                 if parsed.text:
                     if self._on_state_change:
