@@ -54,10 +54,15 @@ def resolve_queries(llm, raw: str) -> str:
         tags = list(dict.fromkeys(QUERY_TAG_RE.findall(raw or "")))
         if not tags:
             return raw
+        tags = tags[:_MAX_QUERIES_PER_ROUND]
+        # Data bank lookups in one round share the lookup max between them.
+        from core.knowledge import lookup_budget
+        n_kb = sum(1 for t in tags if t.upper().startswith("[QUERY:KNOWLEDGE"))
+        kb_budget = lookup_budget() // max(1, n_kb)
         results = []
-        for tag in tags[:_MAX_QUERIES_PER_ROUND]:
+        for tag in tags:
             try:
-                result = execute_query(tag)
+                result = execute_query(tag, kb_budget=kb_budget)
             except Exception as exc:
                 logger.warning("Query %s failed: %s", tag, exc)
                 result = f"[Query failed: {exc}]"
@@ -76,10 +81,11 @@ def resolve_queries(llm, raw: str) -> str:
     return QUERY_TAG_RE.sub("", raw or "").strip()
 
 
-def execute_query(query_tag: str) -> str:
+def execute_query(query_tag: str, kb_budget: int | None = None) -> str:
     """
     Execute a raw query tag string like '[QUERY:FILE_TREE:C:/Users]'.
-    Returns a human/LLM-readable result string.
+    Returns a human/LLM-readable result string. *kb_budget* overrides the
+    token budget for data bank lookups (default: the lookup max).
     """
     inner = query_tag.strip("[]").strip()
     if inner.upper().startswith("QUERY:"):
@@ -100,13 +106,17 @@ def execute_query(query_tag: str) -> str:
     elif qtype == "READ_FILE":
         return _read_file(rest)
     elif qtype == "KNOWLEDGE":
-        # Result size scales with the data bank token budget (and is capped to it).
-        from core.knowledge import search as _kb_search, get_token_budget, wrap_for_budget
-        n = max(1, min(40, get_token_budget() * 4 // 500))
-        return wrap_for_budget(_kb_search(rest.strip(), max_results=n))
+        # Result size scales with the lookup budget (and is capped to it).
+        from core.knowledge import search as _kb_search, lookup_budget, mark_lookup, wrap_for_budget
+        budget = lookup_budget() if kb_budget is None else kb_budget
+        mark_lookup()
+        n = max(1, min(40, budget * 4 // 500))
+        return wrap_for_budget(_kb_search(rest.strip(), max_results=n), budget)
     elif qtype == "KNOWLEDGE_READ":
-        from core.knowledge import read_topic as _kb_read, get_token_budget, wrap_for_budget
-        return wrap_for_budget(_kb_read(rest, max_chars=max(500, get_token_budget() * 4)))
+        from core.knowledge import read_topic as _kb_read, lookup_budget, mark_lookup, wrap_for_budget
+        budget = lookup_budget() if kb_budget is None else kb_budget
+        mark_lookup()
+        return wrap_for_budget(_kb_read(rest, max_chars=max(500, budget * 4)), budget)
     elif qtype == "PAGE_SOURCE":
         return _page_source(rest)
     elif qtype == "CLIPBOARD_HISTORY":

@@ -1108,8 +1108,9 @@ class Pipeline:
         if not query:
             return user_text
         try:
-            from core.knowledge import retrieve_context_block
+            from core.knowledge import retrieve_context_block, record_turn
             block = retrieve_context_block(query)
+            record_turn(bool(block))  # ramp the data bank budget up/down
         except Exception:
             return user_text
         if not block:

@@ -41,11 +41,19 @@ _MAX_RESULTS = 8              # matches returned by default
 _MAX_FILE_CHARS = 8000        # cap when reading a whole file
 _MAX_FILE_BYTES = 1_000_000   # skip files larger than this when searching
 
-# Token budget for data-bank text in any single main-LLM request (auto-retrieved
-# notes, including copies still riding along in the conversation history).
-# Set from config `knowledge.token_budget`; 0 disables auto-retrieval.
-_DEFAULT_TOKEN_BUDGET = 4000
-_token_budget = _DEFAULT_TOKEN_BUDGET
+# Token budget for data-bank text in any single main-LLM request (notes,
+# including copies still riding along in the conversation history). It ramps:
+#   - auto-retrieval starts at _budget_start tokens,
+#   - doubles each turn the data bank is actually used, up to _budget_ramp,
+#   - halves back toward _budget_start on turns it isn't,
+#   - her own [QUERY:KNOWLEDGE...] lookups may use up to _budget_max.
+# Set from config `knowledge.*`; a ramp cap of 0 turns the data bank off.
+_budget_start = 1000
+_budget_ramp = 4000
+_budget_max = 8000
+_budget_level = _budget_start       # current auto-retrieval budget
+_lookup_since_turn = False          # she looked something up since last turn
+_LOOKUP_HEADER = "— lookup result]"
 _CHARS_PER_TOKEN = 4          # rough, provider-agnostic estimate
 _MAX_RETRIEVE_CHUNKS = 64     # hard cap on chunks pulled to fill the budget
 
@@ -211,14 +219,43 @@ def _keyword_search(query: str, max_results: int = _MAX_RESULTS) -> str:
 
 # ── token budget ───────────────────────────────────────────────────────────
 
-def set_token_budget(tokens: int) -> None:
-    """Max data-bank tokens per main-LLM request (0 = no auto-retrieval)."""
-    global _token_budget
-    _token_budget = max(0, int(tokens or 0))
+def set_token_budget(start: int, ramp: int, maximum: int) -> None:
+    """Configure the ramp: *start* → up to *ramp* per request, *maximum* for
+    her own lookups. ramp=0 turns the data bank off. Resets the ramp."""
+    global _budget_start, _budget_ramp, _budget_max, _budget_level
+    _budget_ramp = max(0, int(ramp or 0))
+    _budget_start = max(0, min(int(start or 0), _budget_ramp))
+    _budget_max = max(_budget_ramp, int(maximum or 0)) if _budget_ramp else 0
+    _budget_level = _budget_start
 
 
-def get_token_budget() -> int:
-    return _token_budget
+def current_budget() -> int:
+    """Current auto-retrieval budget (somewhere between start and ramp cap)."""
+    return _budget_level
+
+
+def lookup_budget() -> int:
+    """Budget for her own on-demand lookups (the hard max)."""
+    return _budget_max
+
+
+def mark_lookup() -> None:
+    """Note that she looked something up — counts as the data bank being used."""
+    global _lookup_since_turn
+    _lookup_since_turn = True
+
+
+def record_turn(used: bool) -> None:
+    """Advance the ramp after a user turn: double if the data bank was used
+    (auto-retrieved notes or a lookup since the last turn), else halve back."""
+    global _budget_level, _lookup_since_turn
+    if not _budget_ramp:
+        return
+    if used or _lookup_since_turn:
+        _budget_level = min(_budget_ramp, max(_budget_level, 1) * 2)
+    else:
+        _budget_level = max(_budget_start, _budget_level // 2)
+    _lookup_since_turn = False
 
 
 def estimate_tokens(text: str) -> int:
@@ -230,9 +267,13 @@ def enforce_history_budget(history: list) -> None:
     place) until all of them together fit the token budget.
 
     Newest blocks are kept first, so the notes for the current message always
-    survive. Called by the LLM providers right before each chat request.
+    survive. Called by the LLM providers right before each chat request. The
+    budget is the lookup max when the newest message carries her own lookup
+    results, else the current ramp level.
     """
-    budget = _token_budget
+    newest = history[-1].get("content") if history else None
+    looked_up = isinstance(newest, str) and _LOOKUP_HEADER in newest
+    budget = _budget_max if looked_up else _budget_level
     blocks = []  # (message index, token cost) oldest → newest
     for i, msg in enumerate(history):
         content = msg.get("content")
@@ -248,15 +289,15 @@ def enforce_history_budget(history: list) -> None:
         total -= cost
 
 
-def wrap_for_budget(text: str) -> str:
-    """Fit an on-demand lookup result ([QUERY:KNOWLEDGE...]) into the token
-    budget and mark it as data-bank content, so it's counted — and later
-    dropped oldest-first — alongside auto-retrieved notes."""
-    budget = _token_budget
+def wrap_for_budget(text: str, budget: Optional[int] = None) -> str:
+    """Fit an on-demand lookup result ([QUERY:KNOWLEDGE...]) into *budget*
+    tokens (default: the lookup max) and mark it as data-bank content, so it's
+    counted — and later dropped oldest-first — alongside auto-retrieved notes."""
+    budget = _budget_max if budget is None else budget
     if budget <= 0:
         return ("Your data bank budget is set to Off, so you can't look anything "
                 "up right now. The user can raise it in the right-click menu.")
-    header = f"{_BLOCK_OPEN} — lookup result]"
+    header = f"{_BLOCK_OPEN} {_LOOKUP_HEADER}"
     room = budget * _CHARS_PER_TOKEN - len(header) - len(_BLOCK_CLOSE) - 2
     if len(text) > room:
         text = text[:max(0, room - 40)] + "\n... (cut off at your token budget)"
@@ -267,13 +308,13 @@ def retrieve_context_block(query: str, token_budget: Optional[int] = None) -> st
     """Relevant data-bank chunks for *query*, formatted for prompt injection.
 
     Pulls as many relevant chunks as fit in *token_budget* (default: the
-    configured budget). Returns an empty string when nothing is relevant,
+    current ramp level). Returns an empty string when nothing is relevant,
     semantic search is unavailable, or the budget is 0 — so callers can
     cheaply skip injection. This is the auto-retrieval that fires each
     conversation turn — the SillyTavern-style "feed the model relevant
     memories without being asked" behavior.
     """
-    budget = _token_budget if token_budget is None else max(0, int(token_budget))
+    budget = _budget_level if token_budget is None else max(0, int(token_budget))
     query = (query or "").strip()
     if len(query) < 3 or budget <= 0:
         return ""

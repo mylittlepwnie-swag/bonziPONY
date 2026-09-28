@@ -86,12 +86,17 @@ embeddings:
   batch_size: 64               # chunks per API request
 
 # ── Data bank budget ────────────────────────────────────────────────────
-# Max tokens of data-bank notes sent to your main LLM in any one request
-# (auto-retrieved notes, counting ones still in the conversation history —
-# oldest get dropped first). 0 turns auto-retrieval off. Also settable from
-# the right-click menu → Data Bank Budget.
+# Tokens of data-bank notes sent to your main LLM per request (counting ones
+# still in the conversation history — oldest get dropped first).
+# Auto-retrieved notes start at token_budget_start and ramp up (doubling each
+# turn the data bank is actually used, easing back down when it isn't) to
+# token_budget. When she looks things up herself she can use up to
+# token_budget_max. token_budget: 0 turns the data bank off.
+# Also settable from the right-click menu → Data Bank Budget.
 knowledge:
+  token_budget_start: 1000
   token_budget: 4000
+  token_budget_max: 8000
 
 conversation:
   timeout_s: 60                # seconds to stay in conversation mode after speaking

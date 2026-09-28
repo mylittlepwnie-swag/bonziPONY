@@ -127,10 +127,14 @@ class EmbeddingsConfig:
 @dataclass
 class KnowledgeConfig:
     """Data bank (knowledge/ folder) settings."""
-    # Max data-bank tokens sent to the main LLM in a single request (auto-
-    # retrieved notes, counting ones still in the conversation history).
-    # 0 turns auto-retrieval off.
+    # Data-bank tokens sent to the main LLM per request (notes, counting ones
+    # still in the conversation history). Auto-retrieval starts at
+    # token_budget_start and ramps (doubling each turn the data bank is used)
+    # up to token_budget; her own lookups may use up to token_budget_max.
+    # token_budget: 0 turns the data bank off.
+    token_budget_start: int = 1000
     token_budget: int = 4000
+    token_budget_max: int = 8000
 
 
 @dataclass
@@ -445,7 +449,9 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
         vision_llm=_parse_vision_llm(vlm_raw or None),
         embeddings=_parse_embeddings(emb_raw or None),
         knowledge=KnowledgeConfig(
+            token_budget_start=max(0, int(kb_raw.get("token_budget_start", 1000) or 0)),
             token_budget=max(0, int(kb_raw.get("token_budget", 4000) or 0)),
+            token_budget_max=max(0, int(kb_raw.get("token_budget_max", 8000) or 0)),
         ),
         multi_pony=MultiPonyConfig(
             max_ponies=mp_raw.get("max_ponies", 3),

@@ -841,15 +841,14 @@ class ContextMenuBuilder:
         ], cfg.vision.screen_vision, lambda v: self._set_screen_vision(v))
 
         # ── Data bank token budget (per LLM request) ──────────────────
+        kb = cfg.knowledge
         self._radio_submenu(menu, "Data Bank Budget", [
-            ("Off", 0),
-            ("1,000 tokens", 1000),
-            ("2,000 tokens", 2000),
-            ("4,000 tokens (default)", 4000),
-            ("8,000 tokens", 8000),
-            ("16,000 tokens", 16000),
-        ], cfg.knowledge.token_budget,
-            lambda v: self._set_knowledge_budget(v))
+            ("Off", "0/0/0"),
+            ("Light (500 → 2k, max 4k)", "500/2000/4000"),
+            ("Normal (1k → 4k, max 8k)", "1000/4000/8000"),
+            ("Heavy (2k → 8k, max 16k)", "2000/8000/16000"),
+        ], f"{kb.token_budget_start}/{kb.token_budget}/{kb.token_budget_max}",
+            lambda v: self._set_knowledge_budget(*map(int, v.split("/"))))
 
         menu.addSeparator()
 
@@ -1077,11 +1076,13 @@ class ContextMenuBuilder:
         _save_yaml_value(f"{section}.{key}", value, self.config_path)
         logger.info("Config: %s.%s = %s", section, key, value)
 
-    def _set_knowledge_budget(self, tokens: int) -> None:
+    def _set_knowledge_budget(self, start: int, ramp: int, maximum: int) -> None:
         """Change how many data-bank tokens go into each LLM request (live)."""
         from core.knowledge import set_token_budget
-        self._set("knowledge", "token_budget", int(tokens))
-        set_token_budget(int(tokens))
+        self._set("knowledge", "token_budget_start", start)
+        self._set("knowledge", "token_budget", ramp)
+        self._set("knowledge", "token_budget_max", maximum)
+        set_token_budget(start, ramp, maximum)
 
     def _set_activity_level(self, multiplier: float) -> None:
         """Scale ALL timing settings from a single activity multiplier."""
