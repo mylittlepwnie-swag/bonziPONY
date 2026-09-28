@@ -157,6 +157,10 @@ def main() -> None:
     try:
         from core.knowledge import ensure_dir as _ensure_knowledge_dir
         _ensure_knowledge_dir()
+        # Optional: send vectorizing to a separate embeddings API (own key)
+        # instead of the local model — see the `embeddings:` config block.
+        from core.knowledge_index import configure as _kb_configure
+        _kb_configure(config.embeddings)
         # Build/refresh the semantic vector index off the main thread so the
         # embedding model load + embedding doesn't delay the pony appearing.
         # Falls back to keyword search silently if the model can't load.

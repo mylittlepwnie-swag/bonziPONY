@@ -8,6 +8,10 @@ folder and one small local model.
 Design notes:
   - Model: sentence-transformers ``all-MiniLM-L6-v2`` (384-dim, ~80 MB). It is
     loaded lazily on first use and cached. torch is already a project dep.
+  - Remote option: if the ``embeddings:`` block in config.yaml is enabled
+    (see ``configure()``), vectors come from that OpenAI-compatible
+    ``/v1/embeddings`` API instead, with its own key. The local model is then
+    never loaded, and the main LLM's key/quota is never touched.
   - The index lives in ``knowledge/.vector_index.json`` (gitignored). It tracks
     each file's mtime/size so ``sync()`` only re-embeds what actually changed.
   - Everything degrades gracefully: if sentence-transformers can't be imported
@@ -15,6 +19,7 @@ Design notes:
     False and callers fall back to the keyword search in ``core.knowledge``.
 
 Public API:
+  configure(cfg)                       — route embedding to a remote API (or not)
   is_available()                       — can we do semantic search at all?
   sync(force=False)                    — bring the index in line with the folder
   semantic_search(query, k, min_score) — list[Hit] sorted by similarity
@@ -52,6 +57,10 @@ _lock = threading.Lock()
 _model = None              # cached SentenceTransformer
 _model_failed = False      # True once load has failed, to avoid retry storms
 
+# Remote embeddings API (EmbeddingsConfig) — None means use the local model.
+_api_cfg = None
+_api_client = None
+
 
 @dataclass
 class Hit:
@@ -60,10 +69,74 @@ class Hit:
     score: float
 
 
+# ── backend selection ──────────────────────────────────────────────────────
+
+def configure(cfg) -> None:
+    """Route embedding through a separate remote API (``EmbeddingsConfig``).
+
+    Pass None (or a disabled config) to use the local sentence-transformers
+    model. Call once at startup, before ``sync()``.
+    """
+    global _api_cfg, _api_client
+    if cfg is not None and getattr(cfg, "enabled", False) and (cfg.api_key or cfg.base_url):
+        _api_cfg = cfg
+        logger.info("Data bank embeddings → remote API (%s, model %s).",
+                    cfg.provider, cfg.model)
+    else:
+        if cfg is not None and getattr(cfg, "enabled", False):
+            logger.warning("embeddings.enabled is set but no api_key/base_url — "
+                           "using the local embedding model.")
+        _api_cfg = None
+    _api_client = None
+
+
+def _backend_id() -> str:
+    """Identifies which embedder made the stored vectors (switching invalidates)."""
+    if _api_cfg is not None:
+        return f"api:{_api_cfg.provider}:{_api_cfg.model}"
+    return _MODEL_NAME
+
+
+def _get_api_client():
+    """OpenAI-compatible client for the embeddings API, built on first use."""
+    global _api_client
+    if _api_client is not None:
+        return _api_client
+    from openai import OpenAI
+    from llm.factory import _KNOWN_BASE_URLS
+    cfg = _api_cfg
+    base_url = cfg.base_url or _KNOWN_BASE_URLS.get((cfg.provider or "").lower())
+    _api_client = OpenAI(api_key=cfg.api_key or "no-key", base_url=base_url)
+    return _api_client
+
+
+def _embed_api(texts: List[str]):
+    """Embed via the remote API, batched. Returns L2-normalized vectors or None."""
+    try:
+        import numpy as np
+        client = _get_api_client()
+        batch = max(1, int(_api_cfg.batch_size or 64))
+        out = []
+        for i in range(0, len(texts), batch):
+            resp = client.embeddings.create(model=_api_cfg.model, input=texts[i:i + batch])
+            out.extend(d.embedding for d in sorted(resp.data, key=lambda d: d.index))
+        vecs = np.asarray(out, dtype="float32")
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return vecs / norms
+    except Exception as exc:
+        # Deliberately no local fallback: the point of the API is to keep this
+        # work off the machine. Callers fall back to keyword search instead.
+        logger.warning("Embeddings API call failed (%s) — keyword search this time.", exc)
+        return None
+
+
 # ── model loading ──────────────────────────────────────────────────────────
 
 def is_available() -> bool:
-    """True if semantic search can run (model loadable). Cheap after first call."""
+    """True if semantic search can run (API configured or model loadable)."""
+    if _api_cfg is not None:
+        return True
     return _get_model() is not None
 
 
@@ -94,6 +167,8 @@ def _get_model():
 
 def _embed(texts: List[str]):
     """Encode texts to L2-normalized vectors (list of float lists)."""
+    if _api_cfg is not None:
+        return _embed_api(texts)
     model = _get_model()
     if model is None:
         return None
@@ -154,17 +229,18 @@ def _hard_split(text: str) -> List[str]:
 # ── index persistence ──────────────────────────────────────────────────────
 
 def _load_index() -> dict:
+    backend = _backend_id()
     if not _INDEX_FILE.exists():
-        return {"model": _MODEL_NAME, "entries": []}
+        return {"model": backend, "entries": []}
     try:
         data = json.loads(_INDEX_FILE.read_text(encoding="utf-8"))
-        # A model change invalidates every stored vector.
-        if data.get("model") != _MODEL_NAME:
-            return {"model": _MODEL_NAME, "entries": []}
+        # A model/backend change invalidates every stored vector.
+        if data.get("model") != backend:
+            return {"model": backend, "entries": []}
         return data
     except Exception as exc:
         logger.warning("Could not read vector index (%s) — rebuilding.", exc)
-        return {"model": _MODEL_NAME, "entries": []}
+        return {"model": backend, "entries": []}
 
 
 def _save_index(data: dict) -> None:
@@ -182,7 +258,7 @@ def sync(force: bool = False) -> int:
     drops entries for files that were deleted. Safe to call from a background
     thread at startup. Returns 0 (and does nothing) if the model is unavailable.
     """
-    if _get_model() is None:
+    if not is_available():
         return 0
 
     with _lock:
@@ -242,7 +318,7 @@ def sync(force: bool = False) -> int:
                 })
 
         index["entries"] = new_entries
-        index["model"] = _MODEL_NAME
+        index["model"] = _backend_id()
         _save_index(index)
         logger.info("Vector index synced: %d chunks across %d files.",
                     len(new_entries), len(current_names))
@@ -258,7 +334,7 @@ def semantic_search(query: str, top_k: int = _DEFAULT_TOP_K,
     Empty list if the model is unavailable or nothing clears *min_score*.
     """
     query = (query or "").strip()
-    if not query or _get_model() is None:
+    if not query or not is_available():
         return []
 
     sync()  # cheap when nothing changed; keeps results fresh

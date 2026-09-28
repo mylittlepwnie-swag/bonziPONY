@@ -108,6 +108,23 @@ class VisionLLMConfig:
 
 
 @dataclass
+class EmbeddingsConfig:
+    """Separate embeddings API for the knowledge/ data bank vector index.
+
+    When enabled, vectorizing notes goes to this remote OpenAI-compatible
+    ``/v1/embeddings`` endpoint (with its own key) instead of the local
+    sentence-transformers model — nothing is embedded locally and none of the
+    main LLM's tokens/quota are spent on it.
+    """
+    enabled: bool = False
+    provider: str = "openai"
+    model: str = "text-embedding-3-small"
+    api_key: str = ""
+    base_url: Optional[str] = None
+    batch_size: int = 64
+
+
+@dataclass
 class DesktopControlConfig:
     enabled: bool = True
     allowed_apps: List[str] = field(default_factory=lambda: ["notepad", "calculator", "explorer"])
@@ -202,6 +219,7 @@ class AppConfig:
     watch_mode: WatchModeConfig = None
     tts: TTSConfig = None
     vision_llm: VisionLLMConfig = None
+    embeddings: EmbeddingsConfig = None
     multi_pony: MultiPonyConfig = None
     safety: SafetyConfig = None
     auto_update: bool = False              # auto-pull git updates on launch (off by default)
@@ -220,6 +238,8 @@ class AppConfig:
             self.watch_mode = WatchModeConfig()
         if self.vision_llm is None:
             self.vision_llm = VisionLLMConfig()
+        if self.embeddings is None:
+            self.embeddings = EmbeddingsConfig()
         if self.multi_pony is None:
             self.multi_pony = MultiPonyConfig()
         if self.safety is None:
@@ -251,6 +271,20 @@ def _parse_vision_llm(raw: dict | None) -> VisionLLMConfig | None:
     )
 
 
+def _parse_embeddings(raw: dict | None) -> EmbeddingsConfig | None:
+    """Parse the optional embeddings sub-config (env var is the key fallback)."""
+    if not raw or not isinstance(raw, dict):
+        return None
+    return EmbeddingsConfig(
+        enabled=bool(raw.get("enabled", False)),
+        provider=raw.get("provider", "openai") or "openai",
+        model=raw.get("model", "text-embedding-3-small") or "text-embedding-3-small",
+        api_key=raw.get("api_key", "") or os.environ.get("BONZI_EMBEDDINGS_API_KEY", ""),
+        base_url=raw.get("base_url") or None,
+        batch_size=int(raw.get("batch_size", 64) or 64),
+    )
+
+
 def load_config(path: Path | str = "config.yaml") -> AppConfig:
     """Load and parse config.yaml into AppConfig."""
     config_path = Path(path)
@@ -278,6 +312,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
     wm_raw = raw.get("watch_mode", {})
     tts_raw = raw.get("tts", {})
     vlm_raw = raw.get("vision_llm", {})
+    emb_raw = raw.get("embeddings", {})
     mp_raw = raw.get("multi_pony", {})
     safety_raw = raw.get("safety", {})
     auto_update = bool(raw.get("auto_update", False))
@@ -395,6 +430,7 @@ def load_config(path: Path | str = "config.yaml") -> AppConfig:
             sample_rate=tts_raw.get("sample_rate", 24000),
         ),
         vision_llm=_parse_vision_llm(vlm_raw or None),
+        embeddings=_parse_embeddings(emb_raw or None),
         multi_pony=MultiPonyConfig(
             max_ponies=mp_raw.get("max_ponies", 3),
             inter_pony_chat=mp_raw.get("inter_pony_chat", True),
