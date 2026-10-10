@@ -157,6 +157,8 @@ def main() -> None:
     try:
         from core.knowledge import ensure_dir as _ensure_knowledge_dir
         _ensure_knowledge_dir()
+        from core.knowledge_always import ensure_dir as _ensure_always_dir
+        _ensure_always_dir()
         # Optional: send vectorizing to a separate embeddings API (own key)
         # instead of the local model — see the `embeddings:` config block.
         from core.knowledge_index import configure as _kb_configure

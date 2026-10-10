@@ -197,6 +197,18 @@ def _knowledge_block() -> str:
     )
 
 
+def _knowledge_always_block() -> str:
+    """Files from knowledge_always/, injected verbatim every time (empty if none)."""
+    try:
+        from core.knowledge_always import block_for_prompt
+        blocks = block_for_prompt()
+    except Exception:
+        return ""
+    if not blocks:
+        return ""
+    return f"\n\n{blocks}"
+
+
 def _build_identity_guard(display_name: str) -> str:
     """Build the identity guard + rambling rule block for system prompts."""
     return (
@@ -297,6 +309,9 @@ def get_system_prompt() -> str:
     # Data bank awareness (only if the user has put notes in knowledge/)
     text += _knowledge_block()
 
+    # Always-on knowledge (every file in knowledge_always/, verbatim)
+    text += _knowledge_always_block()
+
     # Identity guard — prevents model from breaking character
     text += _build_identity_guard(display_name)
 
@@ -393,6 +408,9 @@ def get_system_prompt_for(config: PromptConfig) -> str:
 
     # ── Data bank awareness ──
     text += _knowledge_block()
+
+    # ── Always-on knowledge ──
+    text += _knowledge_always_block()
 
     # ── Identity guard ──
     text += _build_identity_guard(display_name)

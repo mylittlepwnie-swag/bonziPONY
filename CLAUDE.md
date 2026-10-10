@@ -66,6 +66,7 @@ main.py (bootstrap + wiring)
 | `character_registry.py` | Scans Ponies/ dirs, maps slugs ↔ display names | `scan_ponies()` |
 | `memory.py` | Session summaries persisted across restarts | `save_summary()`, `load_recent()` |
 | `user_profile.py` | Extracted user facts (name, interests, events) | `load_profile()`, `update_from_conversation()` |
+| `knowledge_always.py` | Files in `knowledge_always/` injected verbatim into every system prompt as `<filename>...</filename>` blocks | `block_for_prompt()` |
 | `diary.py` | Per-character in-character journal | `write_entry()`, `read_recent()` |
 | `monitor_utils.py` | Win32 multi-monitor bounds via ctypes | `get_monitor_rect_for_point()` |
 | `audio_utils.py` | Audio device enumeration helpers | `list_pyaudio_devices()` |
